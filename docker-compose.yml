@@ -1,0 +1,22 @@
+services:
+  tron-api:
+    build: .
+    ports:
+      - "5001:5001"
+    env_file:
+      - .env
+    environment:
+      - GCP_CREDENTIALS_PATH=/app/config/service-account.json
+      - FLASK_HOST=0.0.0.0
+      - FLASK_PORT=5001
+      - DEBUG=False
+    volumes:
+      - ./config/service-account.json:/app/config/service-account.json:ro
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

@@ -1,0 +1,493 @@
+/**
+ * TRON DLP — Content Script Styles
+ * Injected into every page. Uses high-specificity selectors and
+ * isolation to avoid conflicts with host pages.
+ */
+
+/* ─── Scanning Overlay ──────────────────────────────────────── */
+
+.tron-scanning-overlay {
+  position: fixed !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  background: rgba(0, 0, 0, 0.45) !important;
+  backdrop-filter: blur(4px) !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  z-index: 2147483647 !important;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Inter', sans-serif !important;
+  animation: tron-fade-in 0.2s ease !important;
+}
+
+.tron-scanning-card {
+  background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%) !important;
+  border: 1px solid rgba(99, 102, 241, 0.3) !important;
+  border-radius: 16px !important;
+  padding: 32px 40px !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 24px !important;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5), 0 0 40px rgba(99, 102, 241, 0.15) !important;
+}
+
+.tron-scanning-spinner {
+  width: 48px !important;
+  height: 48px !important;
+  border: 3px solid rgba(99, 102, 241, 0.2) !important;
+  border-top-color: #6366f1 !important;
+  border-radius: 50% !important;
+  animation: tron-spin 0.8s linear infinite !important;
+}
+
+.tron-scanning-title {
+  font-size: 18px !important;
+  font-weight: 700 !important;
+  color: #e0e7ff !important;
+  margin-bottom: 4px !important;
+}
+
+.tron-scanning-subtitle {
+  font-size: 14px !important;
+  color: #94a3b8 !important;
+}
+
+.tron-scanning-files {
+  font-size: 12px !important;
+  color: #64748b !important;
+  margin-top: 6px !important;
+  max-width: 300px !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  white-space: nowrap !important;
+}
+
+/* ─── Toast Notifications ───────────────────────────────────── */
+
+.tron-toast {
+  position: fixed !important;
+  bottom: 24px !important;
+  right: 24px !important;
+  padding: 14px 22px !important;
+  border-radius: 12px !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 10px !important;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Inter', sans-serif !important;
+  font-size: 14px !important;
+  font-weight: 500 !important;
+  z-index: 2147483646 !important;
+  transform: translateY(20px) !important;
+  opacity: 0 !important;
+  transition: all 0.35s cubic-bezier(0.4, 0, 0.2, 1) !important;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3) !important;
+}
+
+.tron-toast-visible {
+  transform: translateY(0) !important;
+  opacity: 1 !important;
+}
+
+.tron-toast-clean {
+  background: linear-gradient(135deg, #065f46, #047857) !important;
+  color: #d1fae5 !important;
+  border: 1px solid rgba(16, 185, 129, 0.3) !important;
+}
+
+.tron-toast-blocked {
+  background: linear-gradient(135deg, #7f1d1d, #991b1b) !important;
+  color: #fee2e2 !important;
+  border: 1px solid rgba(239, 68, 68, 0.3) !important;
+}
+
+.tron-toast-info {
+  background: linear-gradient(135deg, #1e3a5f, #1e40af) !important;
+  color: #dbeafe !important;
+  border: 1px solid rgba(96, 165, 250, 0.3) !important;
+}
+
+.tron-toast-warning {
+  background: linear-gradient(135deg, #78350f, #92400e) !important;
+  color: #fef3c7 !important;
+  border: 1px solid rgba(245, 158, 11, 0.3) !important;
+}
+
+.tron-toast-icon {
+  font-size: 18px !important;
+}
+
+/* ─── Modal Overlay ─────────────────────────────────────────── */
+
+.tron-modal-overlay {
+  position: fixed !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  background: rgba(0, 0, 0, 0.6) !important;
+  backdrop-filter: blur(6px) !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  z-index: 2147483647 !important;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Inter', sans-serif !important;
+  opacity: 0 !important;
+  transition: opacity 0.3s ease !important;
+}
+
+.tron-modal-overlay.tron-modal-visible {
+  opacity: 1 !important;
+}
+
+.tron-modal {
+  background: #0f172a !important;
+  border-radius: 20px !important;
+  width: 520px !important;
+  max-width: 95vw !important;
+  max-height: 85vh !important;
+  overflow: hidden !important;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.6), 0 0 60px rgba(99, 102, 241, 0.1) !important;
+  transform: scale(0.9) translateY(20px) !important;
+  transition: transform 0.35s cubic-bezier(0.4, 0, 0.2, 1) !important;
+  display: flex !important;
+  flex-direction: column !important;
+}
+
+.tron-modal-visible .tron-modal {
+  transform: scale(1) translateY(0) !important;
+}
+
+/* ─── Modal Header ──────────────────────────────────────────── */
+
+.tron-modal-header {
+  padding: 28px 28px 20px !important;
+  text-align: center !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06) !important;
+}
+
+.tron-header-blocked {
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.15), rgba(220, 38, 38, 0.05)) !important;
+}
+
+.tron-header-warning {
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.15), rgba(217, 119, 6, 0.05)) !important;
+}
+
+.tron-modal-icon {
+  font-size: 48px !important;
+  margin-bottom: 8px !important;
+}
+
+.tron-modal-header h2 {
+  font-size: 22px !important;
+  font-weight: 700 !important;
+  color: #f1f5f9 !important;
+  margin: 0 0 6px 0 !important;
+  line-height: 1.2 !important;
+}
+
+.tron-modal-header p {
+  font-size: 14px !important;
+  color: #94a3b8 !important;
+  margin: 0 !important;
+}
+
+/* ─── Modal Body ────────────────────────────────────────────── */
+
+.tron-modal-body {
+  padding: 24px 28px !important;
+  overflow-y: auto !important;
+  max-height: 50vh !important;
+}
+
+.tron-file-info {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  margin-bottom: 16px !important;
+  padding: 12px 16px !important;
+  background: rgba(255, 255, 255, 0.04) !important;
+  border-radius: 10px !important;
+  border: 1px solid rgba(255, 255, 255, 0.06) !important;
+}
+
+.tron-file-name {
+  font-size: 14px !important;
+  font-weight: 600 !important;
+  color: #e2e8f0 !important;
+  max-width: 280px !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  white-space: nowrap !important;
+}
+
+.tron-severity {
+  font-size: 11px !important;
+  font-weight: 700 !important;
+  letter-spacing: 0.5px !important;
+  padding: 4px 10px !important;
+  border-radius: 6px !important;
+}
+
+.tron-severity-critical {
+  background: rgba(239, 68, 68, 0.2) !important;
+  color: #fca5a5 !important;
+  border: 1px solid rgba(239, 68, 68, 0.3) !important;
+}
+
+.tron-severity-high {
+  background: rgba(249, 115, 22, 0.2) !important;
+  color: #fdba74 !important;
+  border: 1px solid rgba(249, 115, 22, 0.3) !important;
+}
+
+.tron-severity-medium {
+  background: rgba(245, 158, 11, 0.2) !important;
+  color: #fcd34d !important;
+  border: 1px solid rgba(245, 158, 11, 0.3) !important;
+}
+
+.tron-severity-low {
+  background: rgba(59, 130, 246, 0.2) !important;
+  color: #93c5fd !important;
+  border: 1px solid rgba(59, 130, 246, 0.3) !important;
+}
+
+.tron-findings-summary {
+  font-size: 14px !important;
+  color: #94a3b8 !important;
+  margin-bottom: 16px !important;
+}
+
+.tron-finding-count {
+  font-weight: 700 !important;
+  color: #f59e0b !important;
+  font-size: 16px !important;
+}
+
+/* ─── Findings List ─────────────────────────────────────────── */
+
+.tron-findings-list {
+  display: flex !important;
+  flex-direction: column !important;
+  gap: 6px !important;
+  margin-bottom: 16px !important;
+}
+
+.tron-finding-item {
+  display: flex !important;
+  align-items: center !important;
+  gap: 10px !important;
+  padding: 8px 12px !important;
+  background: rgba(255, 255, 255, 0.03) !important;
+  border-radius: 8px !important;
+  border: 1px solid rgba(255, 255, 255, 0.04) !important;
+  font-size: 13px !important;
+}
+
+.tron-finding-severity {
+  font-size: 10px !important;
+  flex-shrink: 0 !important;
+}
+
+.tron-sev-critical {
+  color: #ef4444 !important;
+}
+
+.tron-sev-high {
+  color: #f97316 !important;
+}
+
+.tron-sev-medium {
+  color: #f59e0b !important;
+}
+
+.tron-sev-low {
+  color: #3b82f6 !important;
+}
+
+.tron-finding-name {
+  color: #cbd5e1 !important;
+  font-weight: 500 !important;
+  white-space: nowrap !important;
+}
+
+.tron-finding-text {
+  color: #64748b !important;
+  font-family: 'SF Mono', 'Fira Code', monospace !important;
+  font-size: 11px !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  white-space: nowrap !important;
+  max-width: 180px !important;
+}
+
+.tron-finding-more {
+  font-size: 12px !important;
+  color: #64748b !important;
+  text-align: center !important;
+  padding: 6px !important;
+}
+
+.tron-domain-info {
+  font-size: 13px !important;
+  color: #64748b !important;
+  padding: 10px 14px !important;
+  background: rgba(255, 255, 255, 0.03) !important;
+  border-radius: 8px !important;
+  margin-bottom: 12px !important;
+}
+
+.tron-domain-info strong {
+  color: #94a3b8 !important;
+}
+
+.tron-warn-message {
+  font-size: 13px !important;
+  color: #fbbf24 !important;
+  background: rgba(245, 158, 11, 0.1) !important;
+  border: 1px solid rgba(245, 158, 11, 0.2) !important;
+  border-radius: 8px !important;
+  padding: 12px 14px !important;
+  line-height: 1.5 !important;
+}
+
+/* ─── Modal Footer ──────────────────────────────────────────── */
+
+.tron-modal-footer {
+  padding: 16px 28px !important;
+  display: flex !important;
+  gap: 12px !important;
+  justify-content: flex-end !important;
+  border-top: 1px solid rgba(255, 255, 255, 0.06) !important;
+  background: rgba(0, 0, 0, 0.2) !important;
+}
+
+.tron-btn {
+  padding: 10px 20px !important;
+  border-radius: 10px !important;
+  font-size: 14px !important;
+  font-weight: 600 !important;
+  cursor: pointer !important;
+  border: none !important;
+  transition: all 0.2s ease !important;
+  font-family: inherit !important;
+}
+
+.tron-btn:hover {
+  transform: translateY(-1px) !important;
+}
+
+.tron-btn-secondary {
+  background: rgba(255, 255, 255, 0.08) !important;
+  color: #cbd5e1 !important;
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+}
+
+.tron-btn-secondary:hover {
+  background: rgba(255, 255, 255, 0.12) !important;
+}
+
+.tron-btn-danger {
+  background: linear-gradient(135deg, #dc2626, #b91c1c) !important;
+  color: white !important;
+}
+
+.tron-btn-danger:hover {
+  background: linear-gradient(135deg, #ef4444, #dc2626) !important;
+  box-shadow: 0 4px 16px rgba(239, 68, 68, 0.3) !important;
+}
+
+.tron-btn-warning {
+  background: linear-gradient(135deg, #d97706, #b45309) !important;
+  color: white !important;
+}
+
+.tron-btn-warning:hover {
+  background: linear-gradient(135deg, #f59e0b, #d97706) !important;
+  box-shadow: 0 4px 16px rgba(245, 158, 11, 0.3) !important;
+}
+
+.tron-modal-brand {
+  text-align: center !important;
+  font-size: 11px !important;
+  color: #475569 !important;
+  padding: 8px !important;
+  letter-spacing: 0.3px !important;
+}
+
+/* ─── AI Analysis Panel ─────────────────────────────────────── */
+
+.tron-ai-panel {
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.08), rgba(139, 92, 246, 0.05)) !important;
+  border: 1px solid rgba(99, 102, 241, 0.2) !important;
+  border-radius: 10px !important;
+  padding: 14px !important;
+  margin-bottom: 14px !important;
+}
+
+.tron-ai-header {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  font-size: 13px !important;
+  font-weight: 700 !important;
+  color: #a5b4fc !important;
+  margin-bottom: 8px !important;
+}
+
+.tron-ai-risk {
+  font-size: 14px !important;
+  font-weight: 800 !important;
+}
+
+.tron-ai-reasoning {
+  font-size: 13px !important;
+  color: #cbd5e1 !important;
+  line-height: 1.5 !important;
+  margin-bottom: 6px !important;
+}
+
+.tron-ai-context {
+  font-size: 12px !important;
+  color: #94a3b8 !important;
+  font-style: italic !important;
+  line-height: 1.4 !important;
+  margin-bottom: 8px !important;
+}
+
+.tron-ai-categories {
+  display: flex !important;
+  flex-wrap: wrap !important;
+  gap: 4px !important;
+}
+
+.tron-ai-cat {
+  font-size: 10px !important;
+  font-weight: 600 !important;
+  padding: 2px 8px !important;
+  border-radius: 4px !important;
+  background: rgba(99, 102, 241, 0.15) !important;
+  color: #c4b5fd !important;
+  border: 1px solid rgba(99, 102, 241, 0.2) !important;
+}
+
+/* ─── Animations ────────────────────────────────────────────── */
+
+@keyframes tron-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes tron-fade-in {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
