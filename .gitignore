@@ -1,0 +1,31 @@
+# Secrets
+.env
+.env.*
+!.env.example
+config/service-account.json
+
+# Runtime data (databases, captured artifacts, logs)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+data/
+*.log
+*.pid
+
+# Build output
+dist/
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

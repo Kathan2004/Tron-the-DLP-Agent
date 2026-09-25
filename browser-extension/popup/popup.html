@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TRON THE DLP AGENT</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+
+<body>
+  <div class="popup-container">
+    <!-- Header -->
+    <div class="popup-header">
+      <div class="header-left">
+        <div class="shield-icon">DLP</div>
+        <div class="header-text">
+          <h1>TRON THE DLP AGENT</h1>
+          <p class="subtitle">AI-Powered Upload Guard</p>
+        </div>
+      </div>
+      <div class="status-toggle">
+        <label class="toggle-switch">
+          <input type="checkbox" id="enableToggle" checked>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+    </div>
+
+    <!-- Stats Bar -->
+    <div class="stats-bar">
+      <div class="stat-item">
+        <span class="stat-value" id="statScans">0</span>
+        <span class="stat-label">Scans</span>
+      </div>
+      <div class="stat-divider"></div>
+      <div class="stat-item">
+        <span class="stat-value stat-blocked" id="statBlocked">0</span>
+        <span class="stat-label">Blocked</span>
+      </div>
+      <div class="stat-divider"></div>
+      <div class="stat-item">
+        <span class="stat-value stat-warned" id="statWarned">0</span>
+        <span class="stat-label">Warned</span>
+      </div>
+      <div class="stat-divider"></div>
+      <div class="stat-item">
+        <span class="stat-value stat-clean" id="statAllowed">0</span>
+        <span class="stat-label">Clean</span>
+      </div>
+    </div>
+
+    <!-- Tabs -->
+    <div class="tab-bar">
+      <button class="tab-btn active" data-tab="activity">Activity</button>
+      <button class="tab-btn" data-tab="settings">Settings</button>
+    </div>
+
+    <!-- Activity Tab -->
+    <div class="tab-content active" id="tab-activity">
+      <div class="activity-list" id="activityList">
+        <div class="empty-state">
+          <div class="empty-icon">--</div>
+          <p>No scans yet</p>
+          <p class="empty-sub">Upload a file on any website to see activity here</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Settings Tab -->
+    <div class="tab-content" id="tab-settings">
+      <div id="settingsManagedNotice" class="managed-notice" style="display:none;">
+        Settings are managed by administrator.
+      </div>
+      <div class="settings-group">
+        <h3>Protection Mode</h3>
+        <div class="radio-group">
+          <label class="radio-option">
+            <input type="radio" name="blockMode" value="block">
+            <span class="radio-custom"></span>
+            <div class="radio-text">
+              <strong>Block</strong>
+              <span>Automatically block sensitive uploads</span>
+            </div>
+          </label>
+          <label class="radio-option">
+            <input type="radio" name="blockMode" value="warn" checked>
+            <span class="radio-custom"></span>
+            <div class="radio-text">
+              <strong>Warn</strong>
+              <span>Show warning, let user decide</span>
+            </div>
+          </label>
+          <label class="radio-option">
+            <input type="radio" name="blockMode" value="monitor">
+            <span class="radio-custom"></span>
+            <div class="radio-text">
+              <strong>Monitor</strong>
+              <span>Log only, don't interfere</span>
+            </div>
+          </label>
+        </div>
+      </div>
+
+      <div class="settings-group">
+        <h3>Minimum Severity</h3>
+        <select id="scanThreshold" class="select-input">
+          <option value="low">Low (all detections)</option>
+          <option value="medium" selected>Medium</option>
+          <option value="high">High</option>
+          <option value="critical">Critical only</option>
+        </select>
+      </div>
+
+      <div class="settings-group">
+        <h3>DLP API Server</h3>
+        <input type="text" id="apiUrl" class="text-input" placeholder="http://localhost:5001"
+          value="http://localhost:5001">
+      </div>
+
+      <div class="settings-group">
+        <h3>AI Analysis (Gemini)</h3>
+        <label class="checkbox-option">
+          <input type="checkbox" id="aiEnabled" checked>
+          <span class="checkbox-custom"></span>
+          <span>Enable AI-powered scanning</span>
+        </label>
+        <div style="margin-top: 8px;">
+          <label style="display:block; font-size:12px; color:#64748b; margin-bottom:4px;">Gemini API Key</label>
+          <input type="password" id="geminiApiKey" class="text-input" placeholder="AIzaSy...">
+        </div>
+        <div style="margin-top: 8px;">
+          <label style="display:block; font-size:12px; color:#64748b; margin-bottom:4px;">AI Scan Mode</label>
+          <select id="aiScanMode" class="select-input">
+            <option value="smart">Smart (AI when regex detects or file &gt; 1KB)</option>
+            <option value="always">Always (scan every file with AI)</option>
+            <option value="never">Never (regex only)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="settings-group">
+        <h3>Options</h3>
+        <label class="checkbox-option">
+          <input type="checkbox" id="reportToApi" checked>
+          <span class="checkbox-custom"></span>
+          <span>Report to DLP API</span>
+        </label>
+        <label class="checkbox-option">
+          <input type="checkbox" id="notifyOnDetection" checked>
+          <span class="checkbox-custom"></span>
+          <span>Desktop notifications</span>
+        </label>
+      </div>
+
+      <div class="settings-actions">
+        <button class="btn btn-save" id="saveSettings">Save Settings</button>
+        <button class="btn btn-clear" id="clearHistory">Clear History</button>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <div class="popup-footer">
+      <span>TRON THE DLP AGENT v2.0 — AI</span>
+      <span class="footer-dot">•</span>
+      <span id="connectionStatus" class="connection-status">Checking API...</span>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+
+</html>

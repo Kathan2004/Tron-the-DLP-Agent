@@ -1,0 +1,24 @@
+#!/bin/bash
+# TRON THE DLP AGENT — Unified Shutdown
+# Stops Frontend + Backend + Ngrok
+
+# Colors
+RED='\033[0;31m'
+NC='\033[0m'
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+echo -e "${RED}Stopping all TRON components...${NC}"
+
+# Kill by name
+pkill -f "python3 main.py" > /dev/null 2>&1
+pkill -f "vite" > /dev/null 2>&1
+pkill -f "ngrok" > /dev/null 2>&1
+
+# Kill by port
+lsof -ti:5001 | xargs kill -9 2>/dev/null
+lsof -ti:5173 | xargs kill -9 2>/dev/null
+
+echo -e "  Done."
+echo ""
