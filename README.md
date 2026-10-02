@@ -23,25 +23,26 @@ All agents check in to the API (fleet heartbeat) and post events to `/api/events
 - Reports incidents and blocked artifacts to the API
 
 **SIEM console** (`siem-console/`, React + Vite)
+- Detector library: enable, tune or reset any built-in detector and create custom ones (pattern + checksum validator + keyword context)
+- Detection Lab: plain-language rule builder, explainable testing, checksum checker and test data generator
 - Dashboard with live event stream
-- Fleet view (endpoint status, commands, collected artifacts)
+- Fleet view (endpoint status, commands, collected artifacts, managed extension settings per agent)
 - Policies and exceptions
 - Governance (audit trail, users, roles and IAM settings)
 - Analytics
 - Events log with event and incident drill-down
-- AI lab: generate a DLP rule from a natural-language prompt
 
 ## Detection pipeline
 
 ```
-content ──► true file type ──► extraction / OCR ──► normalize ──► 47 detectors ──► validators ──► keyword context ──► EDM ──► redaction ──► LLM triage ──► incident + alert
+content ──► true file type ──► extraction / OCR ──► normalize ──► 53 detectors ──► validators ──► keyword context ──► EDM ──► redaction ──► LLM triage ──► incident + alert
             (magic bytes)      PDF, Office, ODF,     NFKC, strip    (PII, financial,  Luhn+IIN,      proximity                     before any     FP probability,
                                RTF, email, zip/tar,  zero-width,    secrets, health,  Verhoeff,      window                        external call  risk score
                                images (Tesseract)    base64 decode  classification)   mod-97, ...
 ```
 
 1. **True type and extraction** (`src/extraction.py`): magic bytes pick the parser, so renamed files are still inspected. PDF text via PDFium, with page-level OCR only for scanned pages; Office/OpenDocument including headers, footers, comments, notes and numeric cells; archives and email attachments recursively with zip-bomb limits; encrypted files reported explicitly.
-2. **Detection** (`src/detection/`): 47 data identifiers with checksum validators (Luhn + issuer ranges, Verhoeff, IBAN mod-97, SSN rules, ABA, GSTIN, JWT), keyword proximity, Unicode/zero-width/base64 evasion handling, and overlap resolution so one value yields one finding. 20 of them cover credentials (GitHub, GitLab, Slack, Stripe, Google, Azure, OpenAI, Anthropic, private keys, credentialed connection strings, entropy-checked generic secrets).
+2. **Detection** (`src/detection/`): 53 data identifiers with 20 validators (Luhn + issuer ranges, Verhoeff, ISO 7064 mod 97-10 and mod 11-2, SSN rules, ABA, NHS, CPF, DNI, TFN, GSTIN, JWT), keyword proximity, Unicode/zero-width/base64 evasion handling, and overlap resolution so one value yields one finding. 20 of them cover credentials (GitHub, GitLab, Slack, Stripe, Google, Azure, OpenAI, Anthropic, private keys, credentialed connection strings, entropy-checked generic secrets).
 3. **Exact Data Match**: optional hashed index of protected records (for example the customer table); a match needs several fields of the same record, not just something that looks like an SSN.
 4. **Policies**: console policies are either custom regexes or references to validated built-in detectors. Files with 10+ identity/financial findings escalate to critical (bulk exposure).
 5. **Redaction and LLM triage** (Gemini): every detected value is replaced with `[REDACTED:<TYPE>]` before the prompt is built. The model returns a false-positive probability, risk score and verdict; without an API key the system falls back to "needs review".
@@ -166,7 +167,7 @@ Run the console separately with `cd siem-console && npm install && npm run dev`.
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                       # 62 tests; OCR tests skip if tesseract is missing
+python -m pytest -q                       # OCR tests skip if tesseract is missing
 python scripts/benchmark_detection.py     # precision/recall + latency
 ```
 

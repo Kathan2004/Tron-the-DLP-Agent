@@ -12,6 +12,9 @@ import Exceptions from './pages/Exceptions';
 import Login from './pages/Login';
 import Profile from './pages/Profile';
 import Governance from './pages/Governance';
+import Detectors from './pages/Detectors';
+import Icon from './components/Icons';
+import { runSoon } from './utils';
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:5001/api';
 
@@ -121,6 +124,7 @@ function App() {
     if (initialHash === '#/profile') return 'profile';
     if (initialHash.startsWith('#/governance') || initialHash === '#/users') return 'admin';
     if (initialHash === '#/lab') return 'lab';
+    if (initialHash === '#/detectors') return 'detectors';
     return 'dashboard';
   })();
 
@@ -139,7 +143,7 @@ function App() {
     tone: 'warning',
   });
   const [sseConnected, setSseConnected] = useState(false);
-  const [authLoading, setAuthLoading] = useState(true);
+  const [authLoading, setAuthLoading] = useState(() => (typeof window !== 'undefined' ? !!window.localStorage.getItem('siem-auth-token') : false));
   const [authToken, setAuthToken] = useState(() => (typeof window !== 'undefined' ? (window.localStorage.getItem('siem-auth-token') || '') : ''));
   const [authUser, setAuthUser] = useState(null);
   const [authPermissions, setAuthPermissions] = useState([]);
@@ -265,7 +269,7 @@ function App() {
     return () => window.removeEventListener('storage', onStorage);
   }, []);
 
-  const applyThemePreference = useCallback((user) => {
+  const applyThemePreference = useCallback((_user) => {
     const local = typeof window !== 'undefined' ? window.localStorage.getItem('siem-theme') : '';
     const resolved = (local === 'light' || local === 'dark') ? local : 'light';
     if (typeof window !== 'undefined' && local !== resolved) {
@@ -296,11 +300,7 @@ function App() {
 
   useEffect(() => {
     const token = (typeof window !== 'undefined' ? window.localStorage.getItem('siem-auth-token') : '') || '';
-    if (!token) {
-      setAuthUser(null);
-      setAuthLoading(false);
-      return;
-    }
+    if (!token) return;  // authLoading starts false when there is no stored token
     const verify = async () => {
       try {
         const res = await fetch(`${API_BASE}/auth/me`, {
@@ -414,9 +414,9 @@ function App() {
   // Dashboard data
   useEffect(() => {
     if (!authUser) return;
-    fetchDashboardData();
+    const cancel = runSoon(fetchDashboardData);
     const interval = setInterval(fetchDashboardData, 10000);
-    return () => clearInterval(interval);
+    return () => { cancel(); clearInterval(interval); };
   }, [fetchDashboardData, authUser]);
 
   // Real-time SSE connection
@@ -525,6 +525,7 @@ function App() {
         '#/governance': 'admin',
         '#/users': 'admin',
         '#/lab': 'lab',
+        '#/detectors': 'detectors',
       };
       if (tabMap[h]) {
         setSelectedIncidentId(null);
@@ -553,6 +554,7 @@ function App() {
     else if (activeTab === 'profile') next = '#/profile';
     else if (activeTab === 'admin') next = current.startsWith('#/governance') ? current : '#/governance/overview';
     else if (activeTab === 'lab') next = '#/lab';
+    else if (activeTab === 'detectors') next = '#/detectors';
 
     if (next && current !== next) {
       window.history.replaceState(null, '', `${window.location.pathname}${next}`);
@@ -590,13 +592,27 @@ function App() {
     if (activeTab === 'events') return 'Event Log';
     if (activeTab === 'analytics') return 'Analytics';
     if (activeTab === 'fleet') return 'Fleet Monitor';
-    if (activeTab === 'policies') return 'Policy Engine';
+    if (activeTab === 'policies') return 'Policies';
+    if (activeTab === 'detectors') return 'Detector Library';
     if (activeTab === 'exceptions') return 'Exceptions';
     if (activeTab === 'profile') return 'Profile & Settings';
     if (activeTab === 'admin') return 'IAM & Governance';
-    if (activeTab === 'lab') return 'AI Policy Lab';
-    return 'Home';
+    if (activeTab === 'lab') return 'Detection Lab';
+    return 'Overview';
   };
+
+  const pageSubtitle = () => ({
+    dashboard: 'Open incidents, risk and live detections across the fleet',
+    analytics: 'Trends, response metrics and detection quality',
+    events: 'Every detection event reported by agents and the browser extension',
+    fleet: 'Endpoint agents and browser extensions, health and commands',
+    policies: 'What to detect, how often, and what to do when it happens',
+    detectors: 'Data identifiers with checksum validation and keyword context; tune or add your own',
+    exceptions: 'Scoped allow rules for users, senders and destinations',
+    profile: 'Your account, preferences and sessions',
+    admin: 'Users, roles, permissions and governance settings',
+    lab: 'Build and test detectors, verify checksums and generate safe test data',
+  }[activeTab] || '');
 
   const can = (permission) => authPermissions.includes(permission) || String(authUser?.role || '').toUpperCase() === 'SUPER_ADMIN';
 
@@ -607,23 +623,41 @@ function App() {
     if (tabId === 'events') return can('events.view');
     if (tabId === 'fleet') return can('fleet.view');
     if (tabId === 'policies') return can('policies.view');
+    if (tabId === 'detectors') return can('policies.view');
     if (tabId === 'exceptions') return can('exceptions.view');
     if (tabId === 'admin') return can('users.manage') || can('iam.manage');
     if (tabId === 'lab') return can('ai_lab.manage');
     return false;
   };
 
-  const navItems = [
-    ...(isTabAllowed('dashboard') ? [{ id: 'dashboard', icon: '', label: 'Home' }] : []),
-    ...(isTabAllowed('analytics') ? [{ id: 'analytics', icon: '', label: 'Analytics' }] : []),
-    ...(isTabAllowed('events') ? [{ id: 'events', icon: '', label: 'Event Log' }] : []),
-    ...(isTabAllowed('fleet') ? [{ id: 'fleet', icon: '', label: 'Fleet Monitor' }] : []),
-    ...(can('policies.view') ? [{ id: 'policies', icon: '', label: 'Policy Engine' }] : []),
-    ...(can('exceptions.view') ? [{ id: 'exceptions', icon: '', label: 'Exceptions' }] : []),
-    { id: 'profile', icon: '', label: 'Profile' },
-    ...((can('users.manage') || can('iam.manage')) ? [{ id: 'admin', icon: '', label: 'Admin' }] : []),
-    ...(can('ai_lab.manage') ? [{ id: 'lab', icon: '', label: 'AI Lab' }] : []),
-  ];
+  const navSections = [
+    {
+      label: 'Monitor',
+      items: [
+        isTabAllowed('dashboard') && { id: 'dashboard', icon: 'home', label: 'Overview' },
+        isTabAllowed('analytics') && { id: 'analytics', icon: 'chart', label: 'Analytics' },
+        isTabAllowed('events') && { id: 'events', icon: 'list', label: 'Event Log' },
+        isTabAllowed('fleet') && { id: 'fleet', icon: 'monitor', label: 'Fleet' },
+      ].filter(Boolean),
+    },
+    {
+      label: 'Protect',
+      items: [
+        can('policies.view') && { id: 'policies', icon: 'policy', label: 'Policies' },
+        can('policies.view') && { id: 'detectors', icon: 'detector', label: 'Detectors' },
+        can('exceptions.view') && { id: 'exceptions', icon: 'exception', label: 'Exceptions' },
+        can('ai_lab.manage') && { id: 'lab', icon: 'lab', label: 'Detection Lab' },
+      ].filter(Boolean),
+    },
+    {
+      label: 'Administration',
+      items: [
+        (can('users.manage') || can('iam.manage')) && { id: 'admin', icon: 'admin', label: 'IAM & Governance' },
+        { id: 'profile', icon: 'user', label: 'Profile' },
+      ].filter(Boolean),
+    },
+  ].filter((sec) => sec.items.length > 0);
+  const navItems = navSections.flatMap((sec) => sec.items);
 
   const hashForTab = (tabId) => {
     if (tabId === 'admin') return '#/governance/overview';
@@ -635,6 +669,7 @@ function App() {
     if (tabId === 'exceptions') return '#/exceptions';
     if (tabId === 'profile') return '#/profile';
     if (tabId === 'lab') return '#/lab';
+    if (tabId === 'detectors') return '#/detectors';
     return '#/dashboard';
   };
 
@@ -646,7 +681,7 @@ function App() {
     }
     if (!allowedTabs.has(activeTab)) {
       const fallback = navItems[0]?.id || 'profile';
-      setActiveTab(fallback);
+      runSoon(() => setActiveTab(fallback));
       const nextHash = fallback === 'profile' ? '#/profile' : `#/${fallback}`;
       if ((window.location.hash || '') !== nextHash) window.location.hash = nextHash;
     }
@@ -741,53 +776,66 @@ function App() {
       {/* Sidebar Navigation */}
       <aside className="sidebar">
         <div className="brand">
-          Tron SIEM
+          <div className="brand-mark"><Icon name="shield" size={18} /></div>
+          <div>
+            <div className="brand-name">Tron DLP</div>
+            <div className="brand-sub">Data Loss Prevention</div>
+          </div>
         </div>
         <nav>
-          {navItems.map(item => (
-            <a key={item.id}
-              href={hashForTab(item.id)}
-              className={`nav-item ${activeTab === item.id ? 'active' : ''}`}
-              style={{ textDecoration: 'none' }}
-              onClick={() => { setActiveTab(item.id); if (item.id !== 'detail') setSelectedIncidentId(null); if (item.id !== 'eventDetail') setSelectedEventId(null); }}
-            >
-              {item.icon} {item.label}
-            </a>
+          {navSections.map(section => (
+            <div key={section.label}>
+              <div className="nav-section">{section.label}</div>
+              {section.items.map(item => (
+                <a key={item.id}
+                  href={hashForTab(item.id)}
+                  className={`nav-item ${activeTab === item.id ? 'active' : ''}`}
+                  onClick={() => { setActiveTab(item.id); if (item.id !== 'detail') setSelectedIncidentId(null); if (item.id !== 'eventDetail') setSelectedEventId(null); }}
+                >
+                  <Icon name={item.icon} size={17} />
+                  {item.label}
+                </a>
+              ))}
+            </div>
           ))}
         </nav>
 
-        {/* SSE Status */}
-        <div style={{
-          marginTop: 'auto', padding: '16px 20px', borderTop: '1px solid var(--border-color)',
-          fontSize: '12px', color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: '8px'
-        }}>
-          <div style={{
-            width: '8px', height: '8px', borderRadius: '50%',
-            background: sseConnected ? '#2ea043' : '#f85149',
-            boxShadow: sseConnected ? '0 0 8px #2ea043' : '0 0 8px #f85149',
-            animation: sseConnected ? 'pulse 2s infinite' : 'none',
-          }} />
-          {sseConnected ? 'Live Stream Connected' : 'Reconnecting...'}
+        <div className="sidebar-footer">
+          <span className={`status-dot ${sseConnected ? 'ok' : ''}`} />
+          {sseConnected ? 'Live stream connected' : 'Reconnecting to live stream'}
         </div>
       </aside>
 
       {/* Main Content Area */}
       <main className="main-content">
-        <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '30px' }}>
-          <h1 className="page-title">
-            {pageTitle()}
-          </h1>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', color: 'var(--text-muted)', fontSize: '14px' }}>
-            <span style={{ fontSize: '12px' }}>{authUser.display_name} ({authUser.role})</span>
-            <button className="btn" style={{ background: 'var(--panel-bg-alt)', border: '1px solid var(--border-color)', color: 'var(--text-strong)' }} onClick={handleLogout}>Logout</button>
+        <header className="topbar">
+          <div>
+            <h1 className="page-title">{pageTitle()}</h1>
+            {pageSubtitle() && <div className="page-subtitle">{pageSubtitle()}</div>}
+          </div>
+          <div className="topbar-actions">
+            <span className="status-pill" title="Policies and detectors sync to agents every few minutes">
+              <span className={`status-dot ${sseConnected ? 'ok' : ''}`} />
+              {sseConnected ? 'Live' : 'Offline'}
+            </span>
             <button
-              className="theme-toggle"
+              className="icon-btn"
               onClick={() => setTheme(prev => (prev === 'dark' ? 'light' : 'dark'))}
-              aria-label="Toggle theme"
+              aria-label={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+              title={theme === 'dark' ? 'Light theme' : 'Dark theme'}
             >
-              {theme === 'dark' ? 'Light' : 'Dark'}
+              <Icon name={theme === 'dark' ? 'sun' : 'moon'} />
             </button>
-            <div className="pulse"></div> System Active — Syncing rules with endpoint agents
+            <span className="user-chip" title={authUser.email}>
+              <span className="avatar">{String(authUser.display_name || authUser.email || '?').split(/\s+/).map(w => w[0]).join('').slice(0, 2).toUpperCase()}</span>
+              <span>
+                <div className="user-chip-name">{authUser.display_name || authUser.email}</div>
+                <div className="user-chip-role">{String(authUser.role || '').replace(/_/g, ' ')}</div>
+              </span>
+            </span>
+            <button className="icon-btn" onClick={handleLogout} aria-label="Log out" title="Log out">
+              <Icon name="logout" />
+            </button>
           </div>
         </header>
 
@@ -797,7 +845,7 @@ function App() {
         {activeTab === 'detail' && selectedIncidentId && (
           <EventDetail incidentId={selectedIncidentId} apiBase={API_BASE} onBack={handleBackFromDetail} />
         )}
-        {activeTab === 'analytics' && <Analytics apiBase={API_BASE} theme={theme} />}
+        {activeTab === 'analytics' && <Analytics apiBase={API_BASE} />}
         {activeTab === 'events' && (
           <EventsLog apiBase={API_BASE} onSelectEvent={handleSelectEvent} />
         )}
@@ -809,6 +857,7 @@ function App() {
         {activeTab === 'exceptions' && <Exceptions apiBase={API_BASE} notify={pushToast} confirmAction={askConfirm} />}
         {activeTab === 'profile' && (
           <Profile
+            key={`${authUser.user_id}-${authUser.updated_at || ''}`}
             apiBase={API_BASE}
             currentUser={authUser}
             notify={pushToast}
@@ -821,7 +870,8 @@ function App() {
           />
         )}
         {activeTab === 'admin' && <Governance apiBase={API_BASE} currentUser={authUser} notify={pushToast} confirmAction={askConfirm} />}
-        {activeTab === 'lab' && <Lab apiBase={API_BASE} />}
+        {activeTab === 'lab' && <Lab apiBase={API_BASE} notify={pushToast} canManage={can('policies.manage')} />}
+        {activeTab === 'detectors' && <Detectors apiBase={API_BASE} notify={pushToast} confirmAction={askConfirm} canManage={can('policies.manage')} />}
       </main>
 
       {/* Toast Notifications Overlay */}
@@ -846,12 +896,12 @@ function App() {
           >
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
               <span style={{ color: toast.color, fontSize: '12px', fontWeight: 700, letterSpacing: '0.5px', textTransform: 'uppercase' }}>
-                {toast.severity} ALERT
+                {toast.incident_id ? `${toast.severity} alert` : ({ success: 'Done', error: 'Error', warning: 'Warning', info: 'Notice' }[toast.severity] || toast.severity)}
               </span>
               <span style={{ color: 'var(--text-muted)', fontSize: '10px' }}>{toast.timestamp}</span>
             </div>
             <div style={{ color: 'var(--text-soft)', fontSize: '13px', lineHeight: '1.4' }}>{toast.message}</div>
-            <div style={{ color: 'var(--text-muted)', fontSize: '10px', marginTop: '4px' }}>Click to investigate →</div>
+            {toast.incident_id && <div style={{ color: 'var(--text-muted)', fontSize: '10px', marginTop: '4px' }}>Click to investigate →</div>}
           </div>
         ))}
       </div>

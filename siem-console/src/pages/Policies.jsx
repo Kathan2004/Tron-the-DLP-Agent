@@ -1,403 +1,339 @@
-import React, { useState, useEffect } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import Icon from '../components/Icons';
+import { runSoon } from '../utils';
+
+const EMPTY_FORM = {
+  name: '', description: '', rule_type: 'detector', detector: 'CREDIT_CARD', value: '',
+  action: 'warn', severity: 'HIGH', threshold_count: 1, threshold_window_mins: 60,
+};
+
+const TYPE_LABEL = { detector: 'Detector', regex: 'Regex', extension: 'File type', file_size: 'File size', network: 'Destination' };
+const VALUE_LABEL = {
+  regex: 'Regular expression',
+  extension: 'Blocked extensions (separate with |)',
+  file_size: 'Maximum file size (MB)',
+  network: 'Blocked domains (comma-separated)',
+};
+const VALUE_PLACEHOLDER = {
+  regex: '\\bPROJECT[ -]FALCON\\b',
+  extension: '.exe|.bat|.scr',
+  file_size: '25',
+  network: 'pastebin.com, transfer.sh',
+};
+const SEV_CHIP = { critical: 'chip-danger', high: 'chip-warning', medium: 'chip-accent', low: '' };
+
+const policyKind = (p) => {
+  const rd = p?.rule_data || {};
+  if ((p?.rule_type || 'regex') === 'regex' && rd.detector) return 'detector';
+  return p?.rule_type || 'regex';
+};
+
+const valueForEdit = (p) => {
+  const rd = p?.rule_data || {};
+  switch (p?.rule_type) {
+    case 'extension': return Array.isArray(rd.blocked_extensions) ? rd.blocked_extensions.join('|') : '';
+    case 'file_size': return rd.max_size_mb != null ? String(rd.max_size_mb) : '';
+    case 'network': return Array.isArray(rd.blocked_domains) ? rd.blocked_domains.join(', ') : '';
+    default: return rd.pattern || p?.regex || '';
+  }
+};
+
+const buildRuleData = (form, existing) => {
+  const raw = String(form.value || '').trim();
+  const meta = existing?.rule_data?._meta ? { _meta: existing.rule_data._meta } : {};
+  switch (form.rule_type) {
+    case 'detector': return { ...meta, detector: form.detector, ...(existing?.rule_data?.pattern ? { pattern: existing.rule_data.pattern } : {}) };
+    case 'extension': return { ...meta, blocked_extensions: raw.split('|').map(x => x.trim()).filter(Boolean).map(x => (x.startsWith('.') ? x : `.${x}`)) };
+    case 'file_size': return { ...meta, max_size_mb: Number(raw) || 10 };
+    case 'network': return { ...meta, blocked_domains: raw.split(',').map(x => x.trim()).filter(Boolean) };
+    default: return { ...meta, pattern: raw };
+  }
+};
 
 const Policies = ({ apiBase, notify, confirmAction }) => {
-    const [policies, setPolicies] = useState([]);
-    const [editingId, setEditingId] = useState(null);
-    const [formData, setFormData] = useState({
-        name: '',
-        description: '',
-        regex_pattern: '',
-        rule_type: 'regex',
-        action: 'block',
-        severity: 'MEDIUM',
-        threshold_count: 3,
-        threshold_window_mins: 60,
-    });
+  const [policies, setPolicies] = useState([]);
+  const [detectors, setDetectors] = useState([]);
+  const [form, setForm] = useState(EMPTY_FORM);
+  const [editing, setEditing] = useState(null);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [query, setQuery] = useState('');
+  const [typeFilter, setTypeFilter] = useState('all');
 
-    const getPatternForEdit = (policy) => {
-        if (policy?.regex_pattern) return policy.regex_pattern;
-
-        const type = policy?.rule_type || 'regex';
-        const rd = policy?.rule_data || {};
-
-        if (type === 'regex') return rd.pattern || '';
-        if (type === 'extension') return Array.isArray(rd.blocked_extensions) ? rd.blocked_extensions.join('|') : '';
-        if (type === 'file_size') return rd.max_size_mb != null ? String(rd.max_size_mb) : '';
-        if (type === 'network') return Array.isArray(rd.blocked_domains) ? rd.blocked_domains.join(',') : '';
-
-        return '';
-    };
-
-    const buildRuleDataFromForm = (fd) => {
-        const type = fd.rule_type || 'regex';
-        const raw = (fd.regex_pattern || '').trim();
-
-        if (type === 'extension') {
-            const blocked_extensions = raw
-                .split('|')
-                .map(x => x.trim())
-                .filter(Boolean)
-                .map(x => (x.startsWith('.') ? x : `.${x}`));
-            return { blocked_extensions };
-        }
-
-        if (type === 'file_size') {
-            const max_size_mb = Number(raw) || 10;
-            return { max_size_mb };
-        }
-
-        if (type === 'network') {
-            const blocked_domains = raw
-                .split(',')
-                .map(x => x.trim())
-                .filter(Boolean);
-            return { blocked_domains };
-        }
-
-        return { pattern: raw };
-    };
-
-    const fetchPolicies = async () => {
-        try {
-            const res = await fetch(`${apiBase}/policies`);
-            const data = await res.json();
-            setPolicies(data.policies || []);
-        } catch (err) {
-            console.error("Failed to load policies", err);
-        }
-    };
-
-    const isAiPolicy = (policy) => {
-        const meta = policy?.rule_data?._meta || {};
-        return meta?.source === 'ai_lab' || meta?.ai_generated === true || policy?.ai_generated === true;
-    };
-
-    const patternLabelByType = {
-        regex: 'Regex Pattern',
-        extension: 'Blocked Extensions (pipe-separated)',
-        file_size: 'Max File Size (MB)',
-        network: 'Blocked Domains (comma-separated)',
-    };
-
-    const patternPlaceholderByType = {
-        regex: '\\bLORD-KATHAN-[A-Z0-9]{8}\\b',
-        extension: '.exe|.bat|.scr',
-        file_size: '10',
-        network: 'dropbox.com, drive.google.com',
-    };
-
-    useEffect(() => {
-        fetchPolicies();
-    }, [apiBase]);
-
-    const notifyUi = (message, severity = 'info') => {
-        if (typeof notify === 'function') {
-            notify(message, severity);
-            return;
-        }
-        alert(message);
-    };
-
-    const confirmUi = async (options) => {
-        if (typeof confirmAction === 'function') {
-            return !!(await confirmAction(options));
-        }
-        return window.confirm(options?.message || 'Are you sure?');
-    };
-
-    const handleSubmit = async (e) => {
-        e.preventDefault();
-        try {
-            const payload = {
-                name: formData.name,
-                description: formData.description,
-                rule_type: formData.rule_type || 'regex',
-                rule_data: buildRuleDataFromForm(formData),
-                regex_pattern: formData.regex_pattern,
-                pattern: formData.regex_pattern,
-                severity: formData.severity,
-                action: formData.action,
-                threshold_count: Number(formData.threshold_count),
-                threshold_window_mins: Number(formData.threshold_window_mins)
-            };
-
-            if (editingId) {
-                // UPDATE Existing
-                const res = await fetch(`${apiBase}/policies/${editingId}`, {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-                if (res.ok) {
-                    notifyUi('Policy updated across all fleet agents!', 'success');
-                }
-            } else {
-                // CREATE New
-                const res = await fetch(`${apiBase}/policies`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-                if (res.ok) {
-                    notifyUi('Policy deployed across all fleet agents!', 'success');
-                }
-            }
-
-            setFormData({ name: '', description: '', regex_pattern: '', rule_type: 'regex', action: 'block', severity: 'MEDIUM', threshold_count: 3, threshold_window_mins: 60 });
-            setEditingId(null);
-            fetchPolicies();
-
-        } catch (err) {
-            console.error(err);
-            notifyUi('Error saving policy', 'error');
-        }
-    };
-
-    const handleToggleActive = async (policy) => {
-        const nextActive = !(policy?.is_active === 1 || policy?.is_active === true);
-        const confirmed = await confirmUi({
-            title: nextActive ? 'Activate Policy' : 'Deactivate Policy',
-            message: nextActive
-                ? 'Activate this policy? It will be enforced on next sync.'
-                : 'Deactivate this policy? It will stop enforcement on next sync.',
-            confirmText: nextActive ? 'Activate' : 'Deactivate',
-            tone: nextActive ? 'warning' : 'warning',
-        });
-        if (!confirmed) return;
-        try {
-            const res = await fetch(`${apiBase}/policies/${policy.policy_id}`, {
-                method: 'PATCH',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ is_active: nextActive ? 1 : 0 })
-            });
-            if (res.ok) fetchPolicies();
-        } catch (err) {
-            console.error(err);
-        }
-    };
-
-    const handleDelete = async (policy) => {
-        const isActive = policy?.is_active === 1 || policy?.is_active === true;
-        const confirmed = await confirmUi({
-            title: 'Delete Policy',
-            message: `${isActive ? 'This policy is ACTIVE. ' : ''}Delete permanently?\n\n${policy?.name || ''}`,
-            confirmText: 'Delete',
-            tone: 'danger',
-        });
-        if (!confirmed) return;
-        try {
-            const res = await fetch(`${apiBase}/policies/${policy.policy_id}`, { method: 'DELETE' });
-            if (res.ok) {
-                if (editingId === policy.policy_id) handleCancelEdit();
-                fetchPolicies();
-                notifyUi(`Policy deleted: ${policy?.name || policy?.policy_id || ''}`, 'success');
-            }
-        } catch (err) {
-            console.error(err);
-            notifyUi('Failed to delete policy', 'error');
-        }
-    };
-
-    const handleEdit = (policy) => {
-        setFormData({
-            name: policy.name,
-            description: policy.description || '',
-            regex_pattern: getPatternForEdit(policy),
-            rule_type: policy.rule_type || 'regex',
-            action: policy.action || 'block',
-            severity: policy.severity,
-            threshold_count: policy.threshold_count,
-            threshold_window_mins: policy.threshold_window_mins,
-        });
-        setEditingId(policy.policy_id);
-        window.scrollTo({ top: 0, behavior: 'smooth' });
-    };
-
-    const handleCancelEdit = () => {
-        setFormData({ name: '', description: '', regex_pattern: '', rule_type: 'regex', action: 'block', severity: 'MEDIUM', threshold_count: 3, threshold_window_mins: 60 });
-        setEditingId(null);
+  const load = async () => {
+    try {
+      const [pr, dr] = await Promise.all([fetch(`${apiBase}/policies`), fetch(`${apiBase}/detectors`)]);
+      const pd = await pr.json();
+      const dd = await dr.json().catch(() => ({}));
+      setPolicies(pd.policies || []);
+      setDetectors(dd.detectors || []);
+    } catch (_) {
+      setError('Could not load policies');
     }
+  };
 
-    return (
-        <div>
-            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(340px, 1fr) 2fr', gap: '20px', alignItems: 'flex-start' }}>
+  useEffect(() => runSoon(load), [apiBase]); // eslint-disable-line react-hooks/exhaustive-deps
 
-                {/* ADD / EDIT POLICY */}
-                <div style={{
-                    background: 'var(--panel-bg)',
-                    border: `1px solid ${editingId ? 'var(--warning)' : 'var(--border-color)'}`,
-                    borderRadius: '12px',
-                    padding: '18px',
-                    boxShadow: 'var(--card-shadow)'
-                }}>
-                    <h3 style={{ marginBottom: '10px', color: 'var(--text-strong)', fontSize: '20px' }}>
-                        {editingId ? "Edit Config" : "Deploy Config Rule"}
-                    </h3>
-                    <p style={{ color: 'var(--text-main)', fontSize: '13px', marginBottom: '18px', lineHeight: 1.5 }}>
-                        When deployed, this config pattern is instantly synced to all Tron browser and endpoint agents.
-                    </p>
+  const detectorByName = useMemo(() => Object.fromEntries(detectors.map(d => [d.name, d])), [detectors]);
+  const groupedDetectors = useMemo(() => {
+    const groups = {};
+    detectors.forEach(d => { (groups[d.category] = groups[d.category] || []).push(d); });
+    return Object.entries(groups).sort();
+  }, [detectors]);
 
-                    <form onSubmit={handleSubmit}>
-                        <div className="form-group">
-                            <label style={{ color: 'var(--text-main)', fontWeight: 600 }}>Config Name</label>
-                            <input type="text" className="form-control" required value={formData.name} onChange={e => setFormData({ ...formData, name: e.target.value })} placeholder="e.g. Project Lord Kathan" />
-                        </div>
-                        <div className="form-group">
-                            <label style={{ color: 'var(--text-main)', fontWeight: 600 }}>Description</label>
-                            <textarea
-                                className="form-control"
-                                rows={3}
-                                value={formData.description}
-                                onChange={e => setFormData({ ...formData, description: e.target.value })}
-                                placeholder="Policy purpose and expected enforcement behavior"
-                            />
-                        </div>
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return policies.filter(p => {
+      if (typeFilter !== 'all' && policyKind(p) !== typeFilter) return false;
+      if (!q) return true;
+      return [p.name, p.description, p.rule_data?.detector, p.rule_data?.pattern].some(x => String(x || '').toLowerCase().includes(q));
+    });
+  }, [policies, query, typeFilter]);
 
-                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '15px' }}>
-                            <div className="form-group">
-                                <label style={{ color: 'var(--text-main)', fontWeight: 600 }}>Rule Type</label>
-                                <select
-                                    className="form-control"
-                                    value={formData.rule_type}
-                                    onChange={e => setFormData({ ...formData, rule_type: e.target.value, regex_pattern: '' })}
-                                >
-                                    <option value="regex">Regex</option>
-                                    <option value="extension">Extension</option>
-                                    <option value="file_size">File Size</option>
-                                    <option value="network">Network Domain</option>
-                                </select>
-                            </div>
-                            <div className="form-group">
-                                <label style={{ color: 'var(--text-main)', fontWeight: 600 }}>Action</label>
-                                <select className="form-control" value={formData.action} onChange={e => setFormData({ ...formData, action: e.target.value })}>
-                                    <option value="monitor">MONITOR</option>
-                                    <option value="warn">WARN</option>
-                                    <option value="block">BLOCK</option>
-                                </select>
-                            </div>
-                        </div>
+  const reset = () => { setForm(EMPTY_FORM); setEditing(null); setError(''); };
 
-                        <div className="form-group">
-                            <label style={{ color: 'var(--text-main)', fontWeight: 600 }}>{patternLabelByType[formData.rule_type] || 'Pattern / Value'}</label>
-                            <input
-                                type={formData.rule_type === 'file_size' ? 'number' : 'text'}
-                                className="form-control"
-                                required
-                                min={formData.rule_type === 'file_size' ? '1' : undefined}
-                                value={formData.regex_pattern}
-                                onChange={e => setFormData({ ...formData, regex_pattern: e.target.value })}
-                                placeholder={patternPlaceholderByType[formData.rule_type] || 'Value'}
-                            />
-                        </div>
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    setError('');
+    const existing = editing ? policies.find(p => p.policy_id === editing) : null;
+    const ruleType = form.rule_type === 'detector' ? 'regex' : form.rule_type;
+    const payload = {
+      name: form.name.trim(),
+      description: form.description,
+      rule_type: ruleType,
+      rule_data: buildRuleData(form, existing),
+      severity: form.severity,
+      action: form.action,
+      threshold_count: Number(form.threshold_count) || 1,
+      threshold_window_mins: Number(form.threshold_window_mins) || 60,
+    };
+    if (form.rule_type === 'detector') payload.detector = form.detector;
+    else payload.pattern = form.value;
+    try {
+      const res = await fetch(editing ? `${apiBase}/policies/${editing}` : `${apiBase}/policies`, {
+        method: editing ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(body.error || 'Could not save policy');
+      } else {
+        notify?.(editing ? `Policy ${payload.name} updated` : `Policy ${payload.name} deployed`, 'success');
+        reset();
+        load();
+      }
+    } catch (_) {
+      setError('Could not reach the API');
+    }
+    setBusy(false);
+  };
 
-                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '15px' }}>
-                            <div className="form-group">
-                                <label style={{ color: 'var(--text-main)', fontWeight: 600 }}>Threshold Hits</label>
-                                <input type="number" className="form-control" required min="1" value={formData.threshold_count} onChange={e => setFormData({ ...formData, threshold_count: parseInt(e.target.value) })} />
-                            </div>
-                            <div className="form-group">
-                                <label style={{ color: 'var(--text-main)', fontWeight: 600 }}>Time Window (Mins)</label>
-                                <input type="number" className="form-control" required min="1" value={formData.threshold_window_mins} onChange={e => setFormData({ ...formData, threshold_window_mins: parseInt(e.target.value) })} />
-                            </div>
-                        </div>
+  const edit = (p) => {
+    const kind = policyKind(p);
+    setForm({
+      name: p.name, description: p.description || '', rule_type: kind,
+      detector: p.rule_data?.detector || 'CREDIT_CARD', value: valueForEdit(p),
+      action: p.action || 'warn', severity: String(p.severity || 'MEDIUM').toUpperCase(),
+      threshold_count: p.threshold_count || 1, threshold_window_mins: p.threshold_window_mins || 60,
+    });
+    setEditing(p.policy_id);
+    setError('');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
 
-                        <div className="form-group">
-                            <label style={{ color: 'var(--text-main)', fontWeight: 600 }}>Severity</label>
-                            <select className="form-control" value={formData.severity} onChange={e => setFormData({ ...formData, severity: e.target.value })}>
-                                <option value="CRITICAL">CRITICAL</option>
-                                <option value="HIGH">HIGH</option>
-                                <option value="MEDIUM">MEDIUM</option>
-                                <option value="LOW">LOW</option>
-                            </select>
-                        </div>
+  const isActive = (p) => !(p.is_active === 0 || p.is_active === false);
 
-                        <button type="submit" className="btn" style={{ width: '100%', marginTop: '10px', backgroundColor: editingId ? 'var(--warning)' : 'var(--accent)', color: 'var(--text-inverse)' }}>
-                            {editingId ? "Update Config in Fleet" : "Deploy Config to Fleet"}
-                        </button>
+  const toggle = async (p) => {
+    const next = !isActive(p);
+    const ok = await confirmAction?.({
+      title: next ? 'Enable policy' : 'Disable policy',
+      message: `${next ? 'Enable' : 'Disable'} ${p.name}? Agents pick up the change on their next sync.`,
+      confirmText: next ? 'Enable' : 'Disable', tone: 'warning',
+    });
+    if (!ok) return;
+    const res = await fetch(`${apiBase}/policies/${p.policy_id}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ is_active: next ? 1 : 0 }),
+    });
+    if (res.ok) load();
+  };
 
-                        {editingId && (
-                            <button type="button" onClick={handleCancelEdit} className="btn" style={{ width: '100%', marginTop: '10px', backgroundColor: 'var(--panel-bg-alt)', border: '1px solid var(--border-color)', color: 'var(--text-strong)' }}>
-                                Cancel Edit
-                            </button>
-                        )}
-                    </form>
-                </div>
+  const remove = async (p) => {
+    const ok = await confirmAction?.({
+      title: 'Delete policy',
+      message: `${isActive(p) ? 'This policy is active. ' : ''}Delete ${p.name} permanently?`,
+      confirmText: 'Delete', tone: 'danger',
+    });
+    if (!ok) return;
+    const res = await fetch(`${apiBase}/policies/${p.policy_id}`, { method: 'DELETE' });
+    if (res.ok) {
+      if (editing === p.policy_id) reset();
+      notify?.(`Policy ${p.name} deleted`, 'success');
+      load();
+    } else {
+      const body = await res.json().catch(() => ({}));
+      notify?.(body.error || 'Could not delete policy', 'error');
+    }
+  };
 
-                {/* ACTIVE POLICIES */}
-                <div style={{
-                    background: 'var(--panel-bg)',
-                    border: '1px solid var(--border-color)',
-                    borderRadius: '12px',
-                    padding: '18px',
-                    boxShadow: 'var(--card-shadow)'
-                }}>
-                    <h3 style={{ marginBottom: '16px', color: 'var(--text-strong)', fontSize: '20px' }}>Fleet Configurations ({policies.length})</h3>
+  const matchSummary = (p) => {
+    const rd = p.rule_data || {};
+    const kind = policyKind(p);
+    if (kind === 'detector') {
+      const d = detectorByName[rd.detector];
+      return (
+        <span className="btn-row" style={{ gap: '6px' }}>
+          <span className="mono" style={{ fontWeight: 600 }}>{rd.detector}</span>
+          {d?.validator && <span className="chip chip-success"><Icon name="check" size={11} />{d.validator}</span>}
+          {d && d.enabled === false && <span className="chip chip-danger">detector disabled</span>}
+          {!d && detectors.length > 0 && <span className="chip chip-danger">unknown detector</span>}
+        </span>
+      );
+    }
+    if (kind === 'extension') return <span className="mono">{(rd.blocked_extensions || []).join(' ')}</span>;
+    if (kind === 'file_size') return <span>&gt; {rd.max_size_mb} MB</span>;
+    if (kind === 'network') return <span className="mono">{(rd.blocked_domains || []).join(', ')}</span>;
+    return <span className="mono" style={{ wordBreak: 'break-all' }}>/{rd.pattern || p.regex}/</span>;
+  };
 
-                    <div className="policy-list">
-                        {policies.map(p => (
-                            <div className="policy-item" key={p.policy_id} style={{
-                                borderLeft: p.policy_id === editingId ? '3px solid var(--warning)' : '3px solid transparent',
-                                background: 'var(--panel-bg-alt)',
-                                opacity: (p.is_active === 0 || p.is_active === false) ? 0.75 : 1,
-                            }}>
-                                <div className="policy-info">
-                                    <h4 style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                        {p.name}
-                                        {isAiPolicy(p) && (
-                                            <span style={{ fontSize: '10px', fontWeight: 700, color: 'var(--accent)', border: '1px solid var(--accent)', borderRadius: '999px', padding: '2px 7px' }}>
-                                                AI
-                                            </span>
-                                        )}
-                                    </h4>
-                                    <div className="policy-meta" style={{ marginTop: '6px', flexWrap: 'wrap', rowGap: '6px' }}>
-                                        <span style={{ color: 'var(--accent)', fontFamily: 'monospace' }}>
-                                            {p.rule_type === 'regex' ? `/${p.regex || p.rule_data?.pattern || p.regex_pattern}/g` : 
-                                             p.rule_type === 'extension' ? `EXT: ${p.rule_data?.blocked_extensions?.join(', ') || p.regex_pattern}` :
-                                             `/${p.regex_pattern || '—'}/g`}
-                                        </span>
-                                        <span style={{ color: 'var(--text-main)' }}>Hits: <strong style={{ color: 'var(--text-strong)' }}>{p.threshold_count}</strong></span>
-                                        <span style={{ color: 'var(--text-main)' }}>Window: <strong style={{ color: 'var(--text-strong)' }}>{p.threshold_window_mins}m</strong></span>
-                                        <span style={{ color: 'var(--text-main)' }}>Action: <strong style={{ color: 'var(--text-strong)' }}>{String(p.action || 'block').toUpperCase()}</strong></span>
-                                    </div>
-                                </div>
-                                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexShrink: 0 }}>
-                                    <span className={`badge ${(p.is_active === 0 || p.is_active === false) ? 'critical' : 'low'}`}>
-                                        {(p.is_active === 0 || p.is_active === false) ? 'DISABLED' : 'ACTIVE'}
-                                    </span>
-                                    <span className={`badge ${p.severity.toLowerCase()}`} style={{ marginRight: '15px' }}>{p.severity}</span>
-                                    <button onClick={() => handleEdit(p)} className="btn" style={{ marginRight: '4px', backgroundColor: 'var(--panel-bg)', border: '1px solid var(--border-color)', color: 'var(--text-strong)' }}>Edit</button>
-                                    <button
-                                        onClick={() => handleToggleActive(p)}
-                                        className="btn"
-                                        style={{
-                                            backgroundColor: (p.is_active === 0 || p.is_active === false) ? 'var(--accent)' : '#b45309',
-                                            color: 'var(--text-inverse)'
-                                        }}
-                                    >
-                                        {(p.is_active === 0 || p.is_active === false) ? 'Activate' : 'Deactivate'}
-                                    </button>
-                                    <button
-                                        onClick={() => handleDelete(p)}
-                                        className="btn"
-                                        style={{ backgroundColor: '#b91c1c', color: 'var(--text-inverse)' }}
-                                    >
-                                        Delete
-                                    </button>
-                                </div>
-                            </div>
-                        ))}
+  const selected = detectorByName[form.detector];
 
-                        {policies.length === 0 && (
-                            <div style={{ padding: '30px', textAlign: 'center', border: '1px dashed var(--border-color)', borderRadius: '8px', color: 'var(--text-muted)' }}>
-                                No configs active. The agents are currently running pre-programmed ML algorithms and standard rules.
-                            </div>
-                        )}
-                    </div>
-                </div>
+  return (
+    <div className="split fade-in">
+      <form className="card" onSubmit={submit} style={{ borderColor: editing ? 'var(--warning)' : undefined }}>
+        <div className="card-title">{editing ? 'Edit policy' : 'New policy'}</div>
+        <div className="card-subtitle" style={{ marginBottom: '14px' }}>Policies sync to every endpoint agent and browser extension.</div>
 
-            </div>
+        <div className="form-group">
+          <label>Name</label>
+          <input className="form-control" required value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} placeholder="e.g. Payment card exfiltration" />
         </div>
-    );
+        <div className="form-group">
+          <label>Description</label>
+          <textarea className="form-control" rows={2} value={form.description} onChange={e => setForm({ ...form, description: e.target.value })} placeholder="Why this policy exists and who owns it" />
+        </div>
+        <div className="form-group">
+          <label>Match on</label>
+          <select className="form-control" value={form.rule_type} onChange={e => setForm({ ...form, rule_type: e.target.value, value: '' })}>
+            <option value="detector">Detector from the library (validated)</option>
+            <option value="regex">Custom regular expression</option>
+            <option value="extension">File type</option>
+            <option value="file_size">File size</option>
+            <option value="network">Destination domain</option>
+          </select>
+        </div>
+
+        {form.rule_type === 'detector' ? (
+          <div className="form-group">
+            <label>Detector</label>
+            <select className="form-control" value={form.detector} onChange={e => setForm({ ...form, detector: e.target.value })}>
+              {groupedDetectors.map(([cat, list]) => (
+                <optgroup key={cat} label={cat}>
+                  {list.map(d => <option key={d.name} value={d.name}>{d.name}{d.enabled === false ? ' (disabled)' : ''}</option>)}
+                </optgroup>
+              ))}
+            </select>
+            {selected && (
+              <div className="field-hint">
+                {selected.description}. {selected.validator ? `Checksum: ${selected.validator}. ` : ''}
+                {(selected.keywords || []).length ? `Keywords${selected.require_keyword ? ' (required)' : ''}: ${selected.keywords.slice(0, 4).join(', ')}.` : ''}
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="form-group">
+            <label>{VALUE_LABEL[form.rule_type]}</label>
+            <input className={`form-control ${form.rule_type === 'regex' ? 'mono' : ''}`} required type={form.rule_type === 'file_size' ? 'number' : 'text'}
+              min={form.rule_type === 'file_size' ? 1 : undefined} value={form.value} onChange={e => setForm({ ...form, value: e.target.value })}
+              placeholder={VALUE_PLACEHOLDER[form.rule_type]} />
+            {form.rule_type === 'regex' && <div className="field-hint">Need a checksum or keyword context? Build a detector in the Detection Lab instead.</div>}
+          </div>
+        )}
+
+        <div className="grid-2">
+          <div className="form-group">
+            <label>Action</label>
+            <select className="form-control" value={form.action} onChange={e => setForm({ ...form, action: e.target.value })}>
+              <option value="monitor">Monitor</option><option value="warn">Warn</option><option value="block">Block</option>
+            </select>
+          </div>
+          <div className="form-group">
+            <label>Severity</label>
+            <select className="form-control" value={form.severity} onChange={e => setForm({ ...form, severity: e.target.value })}>
+              {['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'].map(s => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+          <div className="form-group">
+            <label>Threshold (hits)</label>
+            <input type="number" min="1" className="form-control" value={form.threshold_count} onChange={e => setForm({ ...form, threshold_count: e.target.value })} />
+          </div>
+          <div className="form-group">
+            <label>Window (minutes)</label>
+            <input type="number" min="1" className="form-control" value={form.threshold_window_mins} onChange={e => setForm({ ...form, threshold_window_mins: e.target.value })} />
+          </div>
+        </div>
+        <div className="field-hint" style={{ marginTop: '-6px', marginBottom: '12px' }}>An incident opens when a user hits this policy {form.threshold_count || 1} time(s) within {form.threshold_window_mins || 60} minutes.</div>
+
+        {error && <div className="notice notice-error" style={{ marginBottom: '12px' }}>{error}</div>}
+        <div className="btn-row">
+          <button type="submit" className="btn" disabled={busy} style={{ flex: 1 }}>{busy ? 'Saving...' : editing ? 'Save changes' : 'Deploy policy'}</button>
+          {editing && <button type="button" className="btn btn-secondary" onClick={reset}>Cancel</button>}
+        </div>
+      </form>
+
+      <div className="card">
+        <div className="card-header">
+          <div>
+            <div className="card-title">Policies ({policies.length})</div>
+            <div className="card-subtitle">{policies.filter(isActive).length} active</div>
+          </div>
+        </div>
+        <div className="toolbar">
+          <input className="form-control" style={{ minWidth: '220px' }} placeholder="Search policies" value={query} onChange={e => setQuery(e.target.value)} />
+          <select className="form-control" value={typeFilter} onChange={e => setTypeFilter(e.target.value)}>
+            <option value="all">All types</option>
+            {Object.entries(TYPE_LABEL).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+          </select>
+        </div>
+        {filtered.length === 0 ? (
+          <div className="empty-state">
+            <strong>{policies.length ? 'No policies match' : 'No policies yet'}</strong>
+            {policies.length ? 'Adjust the search or filter.' : 'Without policies, detections are still logged but no incidents are opened.'}
+          </div>
+        ) : (
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead><tr><th style={{ width: 52 }}>On</th><th>Policy</th><th>Match</th><th>Trigger</th><th>Severity</th><th style={{ width: 160 }} /></tr></thead>
+              <tbody>
+                {filtered.map(p => (
+                  <tr key={p.policy_id} className={`${isActive(p) ? '' : 'row-disabled'} ${editing === p.policy_id ? 'row-selected' : ''}`}>
+                    <td><label className="switch"><input type="checkbox" checked={isActive(p)} onChange={() => toggle(p)} /><span /></label></td>
+                    <td>
+                      <div style={{ fontWeight: 600, color: 'var(--text-strong)' }}>
+                        {p.name} {(p.rule_data?._meta?.source === 'ai_lab') && <span className="chip chip-accent">Lab</span>}
+                      </div>
+                      {p.description && <div className="field-hint">{p.description}</div>}
+                    </td>
+                    <td><div className="field-hint" style={{ marginTop: 0 }}>{TYPE_LABEL[policyKind(p)]}</div>{matchSummary(p)}</td>
+                    <td style={{ whiteSpace: 'nowrap' }}>
+                      <div style={{ fontWeight: 600 }}>{String(p.action || 'monitor').toUpperCase()}</div>
+                      <div className="field-hint">{p.threshold_count}x / {p.threshold_window_mins} min</div>
+                    </td>
+                    <td><span className={`chip ${SEV_CHIP[String(p.severity).toLowerCase()] || ''}`}>{p.severity}</span></td>
+                    <td>
+                      <div className="btn-row" style={{ justifyContent: 'flex-end', flexWrap: 'nowrap' }}>
+                        <button className="btn btn-secondary btn-sm" onClick={() => edit(p)}>Edit</button>
+                        <button className="btn btn-danger-outline btn-sm" onClick={() => remove(p)}>Delete</button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
 };
 
 export default Policies;

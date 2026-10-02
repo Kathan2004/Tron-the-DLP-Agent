@@ -4774,6 +4774,13 @@ def update_policy(policy_id):
         return jsonify({"error": "Database not configured"}), 500
         
     data = request.json or {}
+    rule_data = data.get('rule_data') if isinstance(data.get('rule_data'), dict) else None
+    detector = str(data.get('detector') or (rule_data or {}).get('detector') or '').strip()
+    if detector:
+        resolved = policy_detector_name({'detector': detector}, detector_store)
+        if not resolved:
+            return jsonify({"error": f"Unknown detector: {detector}"}), 400
+        data['rule_data'] = {**(rule_data or {}), 'detector': resolved}
     try:
         actor = _actor_from_request('admin')
         success = database.update_policy(policy_id, actor=actor, **data)

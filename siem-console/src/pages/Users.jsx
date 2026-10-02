@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { runSoon } from '../utils';
 
 const emptyForm = {
     email: '',
@@ -45,9 +46,7 @@ const Users = ({ apiBase, currentUser }) => {
         setLoading(false);
     };
 
-    useEffect(() => {
-        if (canManage) loadUsers();
-    }, [apiBase, canManage]);
+    useEffect(() => (canManage ? runSoon(loadUsers) : undefined), [apiBase, canManage]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const managerOptions = useMemo(() => users.map(u => u.email).filter(Boolean), [users]);
 

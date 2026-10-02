@@ -1,4 +1,5 @@
 import React from 'react';
+import { useNow } from '../hooks';
 
 const Dashboard = ({ stats, incidents, onSelectIncident, apiBase, onIncidentsChanged, currentUser }) => {
     const [currentPage, setCurrentPage] = React.useState(1);
@@ -29,12 +30,12 @@ const Dashboard = ({ stats, incidents, onSelectIncident, apiBase, onIncidentsCha
     const canClose = role === 'SUPER_ADMIN' || role === 'SECURITY_ADMIN' || role === 'SOC_ANALYST';
     const canReopen = role === 'SUPER_ADMIN' || role === 'SECURITY_ADMIN' || role === 'SOC_ANALYST';
     
+    const nowMs = useNow();
     const inTimeWindow = (ts) => {
         if (timeFilter === 'all') return true;
         const dt = new Date(ts);
         if (Number.isNaN(dt.getTime())) return false;
-        const now = Date.now();
-        const diff = now - dt.getTime();
+        const diff = nowMs - dt.getTime();
         if (timeFilter === '1h') return diff <= 60 * 60 * 1000;
         if (timeFilter === '24h') return diff <= 24 * 60 * 60 * 1000;
         if (timeFilter === '7d') return diff <= 7 * 24 * 60 * 60 * 1000;
@@ -386,7 +387,7 @@ const Dashboard = ({ stats, incidents, onSelectIncident, apiBase, onIncidentsCha
             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
                 <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border-color)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <h2 style={{ fontSize: '16px', fontWeight: 600, color: 'var(--text-strong)', margin: 0, display: 'flex', alignItems: 'center', gap: '8px' }}>
-                        <span>[ ]</span> Incidents Log
+                        Incidents
                     </h2>
                     <span style={{ fontSize: '12px', color: 'var(--accent)', fontWeight: 600 }}>{sortedIncidents.length} Filtered / {incidents.length} Total</span>
                 </div>

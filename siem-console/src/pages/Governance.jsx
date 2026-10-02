@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { runSoon } from '../utils';
 
 const emptyUserForm = {
     email: '',
@@ -170,19 +171,6 @@ const Governance = ({ apiBase, currentUser, notify, confirmAction }) => {
         setLoading(false);
     };
 
-    const formatAuditDetails = (entry) => {
-        let detailsText = String(entry.details || '');
-        try {
-            const parsed = JSON.parse(detailsText || '{}');
-            detailsText = Object.entries(parsed || {})
-                .map(([k, v]) => `${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`)
-                .join(' · ');
-        } catch (_) {
-            // keep raw details text
-        }
-        return detailsText || '—';
-    };
-
     const formatAuditTimestamp = (rawTs) => {
         const raw = String(rawTs || '').trim();
         if (!raw) return '—';
@@ -194,7 +182,7 @@ const Governance = ({ apiBase, currentUser, notify, confirmAction }) => {
             }
             const parsed = new Date(raw);
             if (!Number.isNaN(parsed.getTime())) return parsed.toLocaleString();
-        } catch (_) {}
+        } catch (_) { /* unparseable timestamp: show raw */ }
         return raw;
     };
 
@@ -228,7 +216,7 @@ const Governance = ({ apiBase, currentUser, notify, confirmAction }) => {
             if (parsed.final_statement) {
                 closingComment = ` - "${parsed.final_statement}"`;
             }
-        } catch (_) {}
+        } catch (_) { /* details are free text, not JSON */ }
 
         const parsedPath = String(parsed?.path || '').toLowerCase();
         const payload = (parsed && typeof parsed.payload === 'object' && parsed.payload) ? parsed.payload : {};
@@ -424,9 +412,7 @@ const Governance = ({ apiBase, currentUser, notify, confirmAction }) => {
         window.history.pushState(null, '', `${window.location.pathname}${next}`);
     }, [activeSection, selectedAuditUser]);
 
-    useEffect(() => {
-        if (canManage) load();
-    }, [apiBase, canManage]);
+    useEffect(() => (canManage ? runSoon(load) : undefined), [apiBase, canManage]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const updateSetting = (key, value) => {
         setSettings((prev) => ({ ...prev, [key]: value }));

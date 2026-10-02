@@ -424,7 +424,7 @@ const EventDetail = ({ incidentId, apiBase, onBack }) => {
                                 </button>
                                 <button className="btn" onClick={() => handleAction('close')} disabled={!!actionLoading}
                                     style={{ background: 'var(--surface-subtle)', color: 'var(--success)', border: '1px solid var(--success)' }}>
-                                    {actionLoading === 'close' ? '...' : '✓ Close (with logs)'}
+                                    {actionLoading === 'close' ? '...' : 'Close (with logs)'}
                                 </button>
                             </>
                         )}
