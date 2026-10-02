@@ -14,7 +14,15 @@ ChartJS.register(
 // Shared chart defaults
 const chartFont = { family: "'Inter', sans-serif" };
 
-const Analytics = ({ apiBase, theme }) => {
+const Metric = ({ label, value, sub, valueColor = 'var(--text-strong)' }) => (
+    <div style={{ borderBottom: '1px solid var(--border-color)', padding: '10px 0' }}>
+        <div style={{ color: 'var(--text-muted)', fontSize: '11px', letterSpacing: '0.8px', fontWeight: 600 }}>{label}</div>
+        <div style={{ color: valueColor, fontSize: '24px', fontWeight: 700, lineHeight: 1.2 }}>{value}</div>
+        {sub && <div style={{ color: 'var(--text-main)', fontSize: '12px', marginTop: '2px' }}>{sub}</div>}
+    </div>
+);
+
+const Analytics = ({ apiBase }) => {
     const [data, setData] = useState(null);
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
@@ -177,7 +185,7 @@ const Analytics = ({ apiBase, theme }) => {
                 borderWidth: 2,
             }]
         };
-    }, [data, cssVars.warning, cssVars.danger, cssVars.success, cssVars.accent, cssVars.panel]);
+    }, [data, cssVars]);
 
     const riskyUsersBar = useMemo(() => ({
         labels: (data?.risky_users || []).slice(0, 8).map(d => d.user),
@@ -319,13 +327,6 @@ const Analytics = ({ apiBase, theme }) => {
         );
     }
 
-    const Metric = ({ label, value, sub, valueColor = 'var(--text-strong)' }) => (
-        <div style={{ borderBottom: '1px solid var(--border-color)', padding: '10px 0' }}>
-            <div style={{ color: 'var(--text-muted)', fontSize: '11px', letterSpacing: '0.8px', fontWeight: 600 }}>{label}</div>
-            <div style={{ color: valueColor, fontSize: '24px', fontWeight: 700, lineHeight: 1.2 }}>{value}</div>
-            {sub && <div style={{ color: 'var(--text-main)', fontSize: '12px', marginTop: '2px' }}>{sub}</div>}
-        </div>
-    );
 
     return (
         <div>
@@ -356,7 +357,7 @@ const Analytics = ({ apiBase, theme }) => {
                             opacity: refreshing ? 0.5 : 1,
                         }}
                     >
-                        {refreshing ? '⟳ Refreshing...' : '↻ Refresh'}
+                        {refreshing ? 'Refreshing...' : 'Refresh'}
                     </button>
                     <div style={{ color: 'var(--text-muted)', fontSize: '11px', whiteSpace: 'nowrap' }}>
                         {lastUpdated ? (

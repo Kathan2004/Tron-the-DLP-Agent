@@ -134,7 +134,7 @@ const FleetView = ({ apiBase, notify }) => {
                 if (data.type === 'incident' && (data.host === selectedAgent.hostname || data.agent_id === selectedAgent.agent_id)) {
                     fetchAgentLogs(selectedAgent.agent_id);
                 }
-            } catch (e) {}
+            } catch (e) { /* ignore malformed stream messages */ }
         };
 
         es.onerror = () => {
@@ -762,9 +762,65 @@ const FleetView = ({ apiBase, notify }) => {
                             <button onClick={() => pushUpgrade(selectedAgent)} className="btn" disabled={upgradeBusy}>
                                 {upgradeBusy ? 'Queueing Upgrade...' : 'Push Upgrade'}
                             </button>
-                            <span style={{ color: 'var(--text-muted)', fontSize: '12px', alignSelf: 'center' }}>
-                                Extension runtime settings are centrally managed by SIEM defaults.
-                            </span>
+                        </div>
+
+                        <div className="card" style={{ marginBottom: '16px', boxShadow: 'none', background: 'var(--panel-bg-alt)' }}>
+                            <div className="card-header" style={{ marginBottom: '10px' }}>
+                                <div>
+                                    <div className="card-title" style={{ fontSize: '14px' }}>Managed protection</div>
+                                    <div className="card-subtitle">Pushed to this agent on its next policy sync. End users cannot change these settings.</div>
+                                </div>
+                                {policyBusy && <span className="chip">Saving...</span>}
+                            </div>
+                            <div style={{ display: 'flex', gap: '22px', flexWrap: 'wrap', marginBottom: '12px' }}>
+                                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px' }}>
+                                    <span className="switch"><input type="checkbox" checked={agentPolicy.enabled !== false} disabled={policyBusy}
+                                        onChange={e => setDlpEnabled(selectedAgent.agent_id, e.target.checked)} /><span /></span>
+                                    DLP enabled
+                                </label>
+                                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px' }}>
+                                    <span className="switch"><input type="checkbox" checked={!!agentPolicy.hardBlockAllUploads} disabled={policyBusy}
+                                        onChange={e => setHardBlock(selectedAgent.agent_id, e.target.checked)} /><span /></span>
+                                    Block all uploads (lockdown)
+                                </label>
+                            </div>
+                            <div className="grid-3">
+                                <div className="form-group">
+                                    <label>Enforcement</label>
+                                    <select className="form-control" value={policyForm.blockMode} onChange={e => setPolicyForm({ ...policyForm, blockMode: e.target.value })}>
+                                        <option value="block">Block</option><option value="warn">Warn</option><option value="monitor">Monitor only</option>
+                                    </select>
+                                </div>
+                                <div className="form-group">
+                                    <label>Minimum severity</label>
+                                    <select className="form-control" value={policyForm.scanThreshold} onChange={e => setPolicyForm({ ...policyForm, scanThreshold: e.target.value })}>
+                                        <option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="critical">Critical</option>
+                                    </select>
+                                </div>
+                                <div className="form-group">
+                                    <label>AI analysis</label>
+                                    <select className="form-control" value={policyForm.aiScanMode} onChange={e => setPolicyForm({ ...policyForm, aiScanMode: e.target.value })}>
+                                        <option value="smart">Smart (images and context-only risk)</option><option value="always">Always</option><option value="never">Never</option>
+                                    </select>
+                                </div>
+                                <div className="form-group">
+                                    <label>Max scanned file size (MB)</label>
+                                    <input type="number" min="1" className="form-control" value={policyForm.maxFileSizeMB} onChange={e => setPolicyForm({ ...policyForm, maxFileSizeMB: e.target.value })} />
+                                </div>
+                                <div className="form-group">
+                                    <label>Allowed domains</label>
+                                    <input className="form-control" value={policyForm.allowedDomainsText} onChange={e => setPolicyForm({ ...policyForm, allowedDomainsText: e.target.value })} placeholder="intranet.example.com" />
+                                </div>
+                                <div className="form-group">
+                                    <label>Always-block domains</label>
+                                    <input className="form-control" value={policyForm.blockedDomainsText} onChange={e => setPolicyForm({ ...policyForm, blockedDomainsText: e.target.value })} placeholder="pastebin.com, transfer.sh" />
+                                </div>
+                            </div>
+                            <div className="form-group">
+                                <label>High-risk domains (stricter inspection)</label>
+                                <input className="form-control" value={policyForm.highRiskDomainsText} onChange={e => setPolicyForm({ ...policyForm, highRiskDomainsText: e.target.value })} placeholder="chat.openai.com, gemini.google.com" />
+                            </div>
+                            <button className="btn btn-sm" disabled={policyBusy} onClick={() => saveAdvancedPolicy(selectedAgent.agent_id)}>Save managed settings</button>
                         </div>
 
                         <h3 style={{ fontSize: '14px', color: 'var(--text-strong)', marginBottom: '12px', display: 'flex', alignItems: 'center', gap: '8px' }}>

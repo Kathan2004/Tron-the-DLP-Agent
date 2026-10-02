@@ -1,8 +1,11 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useNow } from '../hooks';
+import { runSoon } from '../utils';
 
 const EventsLog = ({ apiBase, onSelectEvent }) => {
     const [events, setEvents] = useState([]);
-    const [loading, setLoading] = useState(true);
+    const [, setLoading] = useState(true);
+    const nowMs = useNow();
     const [filterSeverity, setFilterSeverity] = useState('all');
     const [filterAgent, setFilterAgent] = useState('all');
     const [searchQuery, setSearchQuery] = useState('');
@@ -30,12 +33,12 @@ const EventsLog = ({ apiBase, onSelectEvent }) => {
     }, [apiBase]);
 
     useEffect(() => {
-        fetchEvents();
+        const cancel = runSoon(fetchEvents);
         let interval;
         if (autoRefresh) {
             interval = setInterval(fetchEvents, 5000);
         }
-        return () => interval && clearInterval(interval);
+        return () => { cancel(); if (interval) clearInterval(interval); };
     }, [fetchEvents, autoRefresh]);
 
     const severityConfig = {
@@ -149,8 +152,7 @@ const EventsLog = ({ apiBase, onSelectEvent }) => {
         }
 
         if (timePreset === 'all') return true;
-        const now = Date.now();
-        const diff = now - dt.getTime();
+        const diff = nowMs - dt.getTime();
         if (timePreset === '1h') return diff <= 60 * 60 * 1000;
         if (timePreset === '24h') return diff <= 24 * 60 * 60 * 1000;
         if (timePreset === '7d') return diff <= 7 * 24 * 60 * 60 * 1000;
@@ -273,12 +275,10 @@ const EventsLog = ({ apiBase, onSelectEvent }) => {
 
     useEffect(() => {
         const safeTotal = Math.max(1, totalPages || 1);
-        setCurrentPage(prev => Math.min(prev, safeTotal));
+        return runSoon(() => setCurrentPage(prev => Math.min(prev, safeTotal)));
     }, [totalPages]);
 
-    useEffect(() => {
-        setCurrentPage(1);
-    }, [filterSeverity, filterAgent, searchQuery, timePreset, fromTime, toTime]);
+    useEffect(() => runSoon(() => setCurrentPage(1)), [filterSeverity, filterAgent, searchQuery, timePreset, fromTime, toTime]);
 
     return (
         <div style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 120px)' }}>
@@ -405,7 +405,19 @@ const EventsLog = ({ apiBase, onSelectEvent }) => {
                                         <td style={{ padding: '13px 16px' }}>
                                             <span style={{ padding: '3px 10px', borderRadius: '12px', background: conf.bg, color: conf.color, fontSize: '11px', fontWeight: 700 }}>{sev}</span>
                                         </td>
-                                        <td style={{ padding: '13px 16px', color: 'var(--text-main)', fontSize: '13px' }}>{getEventDetailLabel(evt)}</td>
+                                        <td style={{ padding: '13px 16px', color: 'var(--text-main)', fontSize: '13px' }}>
+                                            <div>{getEventDetailLabel(evt)}</div>
+                                            {(() => {
+                                                const rules = parseJson(evt.matched_rules);
+                                                const list = Array.isArray(rules) ? [...new Set(rules)] : [];
+                                                return list.length > 0 ? (
+                                                    <div className="btn-row" style={{ gap: '4px', marginTop: '4px' }}>
+                                                        {list.slice(0, 4).map(r => <span key={r} className="chip chip-accent">{r}</span>)}
+                                                        {list.length > 4 && <span className="chip">+{list.length - 4}</span>}
+                                                    </div>
+                                                ) : null;
+                                            })()}
+                                        </td>
                                     </tr>
                                 </React.Fragment>
                             );

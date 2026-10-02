@@ -9,7 +9,7 @@ upload / paste / file / event
         │
         ▼
  true file type (magic bytes) ──► extraction ──► normalization ──► detectors ──► validators ──► keyword context ──► overlap resolution ──► EDM ──► policy / severity
- pdf, docx, xlsx, pptx, odt,      text layer,     NFKC, strip        47 data        Luhn, IIN,    proximity window      one finding per        exact        bulk threshold,
+ pdf, docx, xlsx, pptx, odt,      text layer,     NFKC, strip        53 data        Luhn, IIN,    proximity window      one finding per        exact        bulk threshold,
  rtf, eml, zip/tar/gz, images     OCR, archives   zero-width chars   identifiers    Verhoeff,     (64 chars): boost      span, strongest        record       encrypted =
                                   (recursive)     base64 decode                     mod-97, ...   or required            wins                   match        explicit finding
 ```
@@ -20,7 +20,7 @@ upload / paste / file / event
 | Extraction | `src/extraction.py` | PDF text layer via PDFium (`pypdfium2`); pages without text are rendered and OCR'd in parallel. OOXML and OpenDocument parsed with the standard library, including headers, footers, comments, footnotes, speaker notes, embedded files and numeric spreadsheet cells. Zip, tar, gzip and email attachments are expanded recursively (depth 3, 500 members, 200 MB, compression-ratio guard). Legacy binary Office files fall back to string extraction. |
 | Encryption | `src/extraction.py` | Password-protected zip, PDF and Office files are detected and surface as an `ENCRYPTED_CONTENT` finding instead of passing as clean. |
 | Normalization | `src/detection/engine.py` | NFKC normalization (full-width digits become ASCII) and removal of zero-width / bidi control characters, which attackers insert to break pattern matching. Base64 blobs are decoded and scanned. |
-| Detectors | `src/detection/library.py` | 47 data identifiers. Each has a literal prefilter so its regex only runs when an anchor is present. |
+| Detectors | `src/detection/library.py` | 53 data identifiers. Each has a literal prefilter so its regex only runs when an anchor is present. |
 | Validators | `src/detection/validators.py` | Checksums and structure checks that turn "looks like" into "is": Luhn + issuer prefix and length for cards, Verhoeff for Aadhaar, mod-97 + country length for IBAN, SSA area/group/serial rules for SSN, ABA checksum, GSTIN checksum, JWT header decoding, entropy and placeholder rejection for secrets. |
 | Context | `src/detection/engine.py` | Keyword proximity within 64 characters. Ambiguous formats (a bare 9-digit number) only fire when a keyword such as "routing" or "ssn" is nearby; others get a confidence boost. |
 | Overlaps | `src/detection/engine.py` | One finding per span: validated beats unvalidated, specific beats generic (`GITHUB_TOKEN` over `GENERIC_SECRET`), then severity and confidence. Console policy findings are never suppressed, because they carry the block/warn action. |
@@ -49,6 +49,12 @@ The browser extension runs the same detectors: `browser-extension/detectors.js` 
 | `IN_GSTIN` | PII | medium | gstin | boost: gst, gstin |
 | `IN_UPI_ID` | Financial | medium | format only | - |
 | `IN_VOTER_ID` | PII | high | format only | required: voter, epic, election |
+| `UK_NHS_NUMBER` | Health | high | uk_nhs | required: nhs, national health, patient |
+| `BR_CPF` | PII | critical | br_cpf | boost: cpf, cadastro |
+| `ES_DNI` | PII | high | es_dni | boost: dni, nie, nif, documento |
+| `AU_TFN` | PII | critical | au_tfn | required: tfn, tax file |
+| `CN_RESIDENT_ID` | PII | critical | iso7064_mod11_2 | boost: id card, resident, 身份证 |
+| `IMEI` | PII | medium | luhn_any | required: imei, device id |
 | `EMAIL_ADDRESS` | PII | low | format only | - |
 | `PHONE_US` | PII | low | format only | boost: phone, tel, mobile, cell |
 | `PHONE_INDIA` | PII | low | format only | boost: phone, mobile, cell, contact |
@@ -80,6 +86,50 @@ The browser extension runs the same detectors: `browser-extension/detectors.js` 
 | `GENERIC_SECRET` | Credentials | high | high_entropy_secret | - |
 | `CLASSIFICATION_LABEL` | Classification | medium | format only | - |
 | `SQL_STATEMENT` | Source Code | low | format only | - |
+
+### Validators
+
+| Validator | What it checks |
+|---|---|
+| `luhn` | Luhn mod-10 checksum, 12-19 digits |
+| `luhn_any` | Luhn mod-10 checksum, any length (IMEI, loyalty and custom account numbers) |
+| `payment_card` | Luhn + issuer prefix and length (Visa, Mastercard, Amex, Discover, JCB, Diners, UnionPay, Maestro, RuPay) |
+| `verhoeff` | Verhoeff checksum (dihedral group D5) |
+| `aadhaar` | Verhoeff + Aadhaar structure (12 digits, first digit 2-9) |
+| `iso7064_mod97` | ISO 7064 MOD 97-10 over alphanumerics (remainder 1) |
+| `iban` | IBAN: country-specific length + ISO 7064 MOD 97-10 |
+| `iso7064_mod11_2` | ISO 7064 MOD 11-2 (check character 0-9 or X) |
+| `us_ssn` | US SSN area/group/serial rules (no 000/666/9xx areas, no 00 group, no 0000 serial) |
+| `aba_routing` | US ABA routing number weighted checksum (3-7-1) |
+| `ca_sin` | Canadian SIN Luhn checksum (9 digits) |
+| `uk_nhs` | UK NHS number weighted mod 11 |
+| `br_cpf` | Brazilian CPF two mod-11 check digits |
+| `es_dni` | Spanish DNI/NIE mod-23 control letter |
+| `au_tfn` | Australian Tax File Number weighted mod 11 |
+| `gstin` | Indian GSTIN base-36 checksum character |
+| `jwt` | JWT header decodes to JSON with an alg field |
+| `not_placeholder` | Rejects placeholders (changeme, your-..., <...>, ${VAR}) and values under 6 chars |
+| `high_entropy_secret` | Secret-like: >= 16 chars, mixed charset, Shannon entropy >= 3.5, not a placeholder or identifier |
+| `url_credentials` | URL with user:password@ where the password is not a placeholder |
+
+## Editing the library (console)
+
+The **Detectors** page lists every detector with its validator, keywords and the policies that use it.
+
+- **Built-in detectors** can be enabled or disabled and their severity, confidence, keywords, keyword requirement, pattern, validator and case sensitivity changed. Changes are stored as overrides (`detector_overrides` table) and can be reset to the shipped defaults at any time.
+- **Custom detectors** combine a pattern, an optional capture group, any validator above, and keyword context (`custom_detectors` table).
+- Every edit is validated before it is stored: the pattern must compile, must not match the empty string, and may only use regex syntax shared by Python and JavaScript, because the same definition runs in the browser extension.
+- Changes reach the API scanner, agent event matching (rules engine), the endpoint agents and the browser extension (delivered with policy sync). Disabling a detector stops alerting on it but **never** weakens LLM redaction, which always runs every built-in detector.
+- All changes are written to the audit log.
+
+## Detection Lab
+
+- **Rule builder**: describe what to protect in plain language. With a Gemini key the LLM drafts a rule; without one, an offline builder maps known identifiers to validated built-ins ("alert on Aadhaar numbers") and builds custom detectors from example values ("employee IDs like EMP-482913 with a Luhn check digit" becomes `\bEMP-\d{6}\b` + `luhn_any`). Drafts are validated server-side and can be saved as a detector and policy in one step.
+- **Explainable testing**: every regex candidate is shown with its checksum result, the keyword found nearby and the final decision with the reason ("failed luhn_any check", "no keyword within 64 characters").
+- **Checksum tools**: which validators a value passes, and a generator of random values with correct check digits (cards per brand, IBAN per country, Aadhaar, SSN, NHS, CPF, DNI, TFN, Chinese ID, IMEI, GSTIN, ...) for testing policies end to end.
+- **Library scan**: run any text through the live library and see highlighted findings with their evidence.
+
+API: `GET/POST /api/detectors`, `PATCH/DELETE /api/detectors/<name>`, `POST /api/detectors/test` (trace), `POST /api/detectors/check`, `POST /api/detectors/generate`.
 
 Console policies can reference any detector by name instead of a raw regex (`rule_data: {"detector": "CREDIT_CARD"}`, or `"detector": "CREDIT_CARD"` in `POST /api/policies`). The catalogue is served at `GET /api/detectors`. The default policies use these references; untouched default policies in existing databases are upgraded automatically, edited ones are left alone.
 
@@ -122,7 +172,7 @@ The corpus (`tests/detection_corpus.py`) was written alongside the engine, so it
 | 100 KB | 48 ms | 16 ms |
 | 1 MB | 528 ms | 177 ms (73 findings vs 239, most of the 239 false positives) |
 | 10 MB | 4.4 s | 1.6 s |
-| Browser extension, 1 MB | 34 ms (20 unvalidated patterns) | 73 ms (47 detectors, validators, decode pass); a typical paste of a few KB takes under 1 ms |
+| Browser extension, 1 MB | 34 ms (20 unvalidated patterns) | 73 ms (47 detectors at the time of measurement, validators, decode pass); a typical paste of a few KB takes under 1 ms |
 
 ### Extraction: replacing Docling
 

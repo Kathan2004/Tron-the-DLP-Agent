@@ -1,4 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { useNow } from '../hooks';
+import { runSoon } from '../utils';
 
 const emptyForm = {
     name: '',
@@ -16,6 +18,7 @@ const emptyForm = {
 };
 
 const Exceptions = ({ apiBase, notify, confirmAction }) => {
+    const nowMs = useNow();
     const [exceptions, setExceptions] = useState([]);
     const [policies, setPolicies] = useState([]);
     const [fleetUsers, setFleetUsers] = useState([]);
@@ -61,7 +64,7 @@ const Exceptions = ({ apiBase, notify, confirmAction }) => {
         const expiryRaw = String(ex?.expires_at || '').trim();
         const expiryMs = expiryRaw ? Date.parse(expiryRaw) : NaN;
         const hasValidExpiry = Number.isFinite(expiryMs);
-        const isExpired = hasValidExpiry && expiryMs <= Date.now();
+        const isExpired = hasValidExpiry && expiryMs <= nowMs;
 
         if (!enabled) {
             return { label: 'DISABLED', badgeClass: 'critical', isEffectiveActive: false };
@@ -191,9 +194,7 @@ const Exceptions = ({ apiBase, notify, confirmAction }) => {
         }
     };
 
-    useEffect(() => {
-        fetchData();
-    }, [apiBase]);
+    useEffect(() => runSoon(fetchData), [apiBase]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const notifyUi = (message, severity = 'info') => {
         if (typeof notify === 'function') {
@@ -520,13 +521,14 @@ const Exceptions = ({ apiBase, notify, confirmAction }) => {
                             </div>
                         </div>
 
-                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: '0' }}>
                             <div className="form-group">
                                 <label style={{ color: 'var(--text-main)', fontWeight: 600 }}>Expires At</label>
                                 <div style={{ display: 'flex', gap: '8px' }}>
                                     <input
                                         type="datetime-local"
                                         className="form-control"
+                                        style={{ minWidth: 0 }}
                                         value={formData.expires_at}
                                         onChange={e => setFormData({ ...formData, expires_at: e.target.value })}
                                     />

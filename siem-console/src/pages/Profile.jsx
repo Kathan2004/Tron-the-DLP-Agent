@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { runSoon } from '../utils';
 
 const Profile = ({ apiBase, currentUser, onUserUpdated, notify }) => {
     const [profile, setProfile] = useState({
@@ -18,23 +19,7 @@ const Profile = ({ apiBase, currentUser, onUserUpdated, notify }) => {
     const [sessions, setSessions] = useState([]);
     const [loadingSessions, setLoadingSessions] = useState(false);
 
-    useEffect(() => {
-        setProfile({
-            display_name: currentUser?.display_name || '',
-            timezone: currentUser?.timezone || 'Asia/Kolkata',
-            locale: currentUser?.locale || 'en-IN',
-            theme_preference: currentUser?.theme_preference || 'light',
-            notify_email: currentUser?.notify_email ?? true,
-            notify_telegram: currentUser?.notify_telegram ?? true,
-        });
-    }, [
-        currentUser?.display_name,
-        currentUser?.timezone,
-        currentUser?.locale,
-        currentUser?.theme_preference,
-        currentUser?.notify_email,
-        currentUser?.notify_telegram,
-    ]);
+    // Profile state is initialised from currentUser; App re-mounts this page (key) when the user record changes.
 
     const tzOptions = useMemo(() => [
         'Asia/Kolkata', 'UTC', 'America/New_York', 'Europe/London', 'Asia/Singapore'
@@ -56,9 +41,7 @@ const Profile = ({ apiBase, currentUser, onUserUpdated, notify }) => {
         setLoadingSessions(false);
     };
 
-    useEffect(() => {
-        loadSessions();
-    }, [apiBase]);
+    useEffect(() => runSoon(loadSessions), [apiBase]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const saveProfile = async (e) => {
         e.preventDefault();
@@ -233,7 +216,7 @@ const Profile = ({ apiBase, currentUser, onUserUpdated, notify }) => {
                 <div style={{ marginTop: '22px' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
                         <h3 style={{ margin: 0, fontSize: '15px' }}>Active Sessions</h3>
-                        <button className="btn" style={{ background: '#b45309' }} onClick={revokeAllOtherSessions}>Revoke Other Sessions</button>
+                        <button className="btn btn-danger-outline btn-sm" onClick={revokeAllOtherSessions}>Revoke other sessions</button>
                     </div>
                     {loadingSessions ? (
                         <div style={{ color: 'var(--text-muted)' }}>Loading sessions...</div>
@@ -242,14 +225,14 @@ const Profile = ({ apiBase, currentUser, onUserUpdated, notify }) => {
                     ) : (
                         <div style={{ display: 'grid', gap: '8px' }}>
                             {sessions.map((s) => (
-                                <div key={s.session_id} style={{ border: '1px solid var(--border-color)', borderRadius: '8px', padding: '8px 10px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px' }}>
+                                <div key={s.session_id} style={{ border: '1px solid var(--border-color)', borderRadius: '8px', padding: '8px 10px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px', opacity: s.revoked_at ? 0.6 : 1 }}>
                                     <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
-                                        <div style={{ color: 'var(--text-strong)' }}>{s.is_current ? 'Current session' : 'Session'}</div>
+                                        <div style={{ color: 'var(--text-strong)', display: 'flex', gap: '6px', alignItems: 'center' }}>{s.is_current ? 'Current session' : 'Session'}{s.is_current && <span className="chip chip-success">this device</span>}{s.revoked_at && <span className="chip">revoked</span>}</div>
                                         <div>{s.ip_address || 'Unknown IP'} · {s.user_agent || 'Unknown client'}</div>
                                         <div>Issued: {s.issued_at || '—'}{s.revoked_at ? ` · Revoked: ${s.revoked_at}` : ''}</div>
                                     </div>
                                     {!s.is_current && !s.revoked_at && (
-                                        <button className="btn" style={{ background: '#b45309' }} onClick={() => revokeSession(s.session_id)}>Revoke</button>
+                                        <button className="btn btn-danger-outline btn-sm" onClick={() => revokeSession(s.session_id)}>Revoke</button>
                                     )}
                                 </div>
                             ))}
