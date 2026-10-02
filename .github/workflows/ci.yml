@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: System packages (OCR)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tesseract-ocr
+      - name: Install
+        run: pip install -r requirements-dev.txt
+      - name: Extension detectors are generated from the Python library
+        run: python scripts/build_extension_detectors.py --check
+      - name: Tests (detection, extraction, rules engine, API, extension parity)
+        run: python -m pytest -q
+      - name: Detection benchmark
+        run: python scripts/benchmark_detection.py
+
+  console:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: siem-console
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: siem-console/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
+  extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Manifest and script syntax
+        run: |
+          node -e 'const m=require("./browser-extension/manifest.json"); const fs=require("fs");
+            const files=[m.background.service_worker, ...m.content_scripts.flatMap(c=>[...c.js,...(c.css||[])]), ...Object.values(m.icons)];
+            for (const f of files) { if (!fs.existsSync("browser-extension/"+f)) { console.error("missing", f); process.exit(1) } }
+            console.log("manifest ok")'
+          for f in browser-extension/*.js browser-extension/popup/*.js; do node --check "$f"; done

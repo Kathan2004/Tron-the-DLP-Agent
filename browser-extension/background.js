@@ -4,6 +4,7 @@
  * Manages scan results, settings, and notifications.
  */
 
+importScripts("detectors.js");
 importScripts("scanner.js");
 importScripts("ai_analyzer.js");
 

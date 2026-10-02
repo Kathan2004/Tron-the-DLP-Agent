@@ -2,13 +2,11 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# System dependencies: gcc for wheels, curl for the healthcheck,
-# tesseract + poppler for OCR of images and scanned PDFs.
+# System dependencies: curl for the healthcheck, tesseract for OCR of images and
+# scanned PDFs (PDF pages are rendered by pypdfium2, so poppler is not needed).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
     curl \
     tesseract-ocr \
-    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
