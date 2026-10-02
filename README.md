@@ -8,7 +8,7 @@ Open-source endpoint and web data loss prevention: agents and a Chrome extension
 [![Python 3.11](https://img.shields.io/badge/python-3.11-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![React 19](https://img.shields.io/badge/react-19-61DAFB.svg?logo=react&logoColor=black)](https://react.dev/)
 
-> **Status:** in progress. Built as a learning and portfolio project; not hardened for production use.
+> **Status:** active development. Open-source endpoint and web DLP platform; contributions welcome. Before deploying in production, review the [Roadmap](#roadmap) (TLS and production WSGI, per-agent authentication for ingest endpoints) and the [Security notes](#security-notes).
 
 ## What it does
 
