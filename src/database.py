@@ -30,6 +30,30 @@ def _migrate_legacy_db_name() -> None:
     print(f"Migrated database {LEGACY_DB_PATH.name} -> {DB_PATH.name}")
 
 
+# Original (pre-detector) default policy regexes, used to recognise untouched seed rows.
+LEGACY_DEFAULT_POLICY_RULE_DATA = {
+    "POL-DEFAULT-1": {"pattern": r"\b\d{3}-\d{2}-\d{4}\b"},
+    "POL-DEFAULT-2": {"pattern": r"\b(?:\d{4}[-\s]?){3}\d{4}\b|\b\d{13,19}\b"},
+    "POL-DEFAULT-3": {"pattern": r"\b[A-Z]{2}\d{2}[A-Z0-9]{1,30}\b"},
+    "POL-DEFAULT-4": {"pattern": r"\b[A-Z]{5}[0-9]{4}[A-Z]{1}\b"},
+    "POL-DEFAULT-5": {"pattern": r"\b\d{4}\s?\d{4}\s?\d{4}\b"},
+}
+DEFAULT_POLICY_RULE_DATA = {
+    "POL-DEFAULT-1": {"detector": "US_SSN", "pattern": r"\b\d{3}-\d{2}-\d{4}\b"},
+    "POL-DEFAULT-2": {"detector": "CREDIT_CARD", "pattern": r"\b(?:\d{4}[-\s]?){3}\d{4}\b"},
+    "POL-DEFAULT-3": {"detector": "IBAN", "pattern": r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b"},
+    "POL-DEFAULT-4": {"detector": "IN_PAN", "pattern": r"\b[A-Z]{3}[PCHFATBLJG][A-Z][0-9]{4}[A-Z]\b"},
+    "POL-DEFAULT-5": {"detector": "IN_AADHAAR", "pattern": r"\b[2-9]\d{3}\s?\d{4}\s?\d{4}\b"},
+}
+
+
+def _json_equal(raw, expected: dict) -> bool:
+    try:
+        return json.loads(raw or "{}") == expected
+    except Exception:
+        return False
+
+
 class Database:
     """Thread-safe SQLite database for DLP data persistence."""
 
@@ -488,14 +512,16 @@ class Database:
                     VALUES (?, ?, ?, ?, ?)
                 """, default_team)
 
+            # Default policies reference validated built-in detectors (src/detection); "pattern" is
+            # kept as a plain-regex fallback for older extension builds and for display.
             cur.execute("SELECT COUNT(*) FROM policies")
             if cur.fetchone()[0] == 0:
                 defaults = [
-                    ("POL-DEFAULT-1", "SSN_PATTERN", "US Social Security Number", "regex", json.dumps({"pattern": r"\b\d{3}-\d{2}-\d{4}\b"}), "HIGH", "monitor", 3, 30),
-                    ("POL-DEFAULT-2", "CREDIT_CARD", "Credit Card (formatted)", "regex", json.dumps({"pattern": r"\b(?:\d{4}[-\s]?){3}\d{4}\b|\b\d{13,19}\b"}), "CRITICAL", "monitor", 1, 60),
-                    ("POL-DEFAULT-3", "IBAN", "IBAN Account Number", "regex", json.dumps({"pattern": r"\b[A-Z]{2}\d{2}[A-Z0-9]{1,30}\b"}), "HIGH", "monitor", 3, 30),
-                    ("POL-DEFAULT-4", "PAN_INDIA", "India PAN Card", "regex", json.dumps({"pattern": r"\b[A-Z]{5}[0-9]{4}[A-Z]{1}\b"}), "HIGH", "monitor", 3, 30),
-                    ("POL-DEFAULT-5", "AADHAAR", "India Aadhaar Card", "regex", json.dumps({"pattern": r"\b\d{4}\s?\d{4}\s?\d{4}\b"}), "HIGH", "monitor", 3, 30),
+                    ("POL-DEFAULT-1", "SSN_PATTERN", "US Social Security Number", "regex", json.dumps(DEFAULT_POLICY_RULE_DATA["POL-DEFAULT-1"]), "HIGH", "monitor", 3, 30),
+                    ("POL-DEFAULT-2", "CREDIT_CARD", "Payment card number (Luhn validated)", "regex", json.dumps(DEFAULT_POLICY_RULE_DATA["POL-DEFAULT-2"]), "CRITICAL", "monitor", 1, 60),
+                    ("POL-DEFAULT-3", "IBAN", "IBAN Account Number (mod-97 validated)", "regex", json.dumps(DEFAULT_POLICY_RULE_DATA["POL-DEFAULT-3"]), "HIGH", "monitor", 3, 30),
+                    ("POL-DEFAULT-4", "PAN_INDIA", "India PAN Card", "regex", json.dumps(DEFAULT_POLICY_RULE_DATA["POL-DEFAULT-4"]), "HIGH", "monitor", 3, 30),
+                    ("POL-DEFAULT-5", "AADHAAR", "India Aadhaar Card (Verhoeff validated)", "regex", json.dumps(DEFAULT_POLICY_RULE_DATA["POL-DEFAULT-5"]), "HIGH", "monitor", 3, 30),
                     ("POL-DEFAULT-11", "LARGE_UPLOAD", "Block Large File Uploads (>10MB)", "file_size", json.dumps({"max_size_mb": 10}), "HIGH", "block", 1, 60)
                 ]
                 cur.executemany("""
@@ -503,6 +529,14 @@ class Database:
                     (policy_id, name, description, rule_type, rule_data, severity, action, threshold_count, threshold_window_mins)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, defaults)
+            else:
+                # Upgrade untouched legacy default policies (exact original regex) to detector references.
+                for policy_id, legacy in LEGACY_DEFAULT_POLICY_RULE_DATA.items():
+                    cur.execute("SELECT rule_data FROM policies WHERE policy_id = ?", (policy_id,))
+                    row = cur.fetchone()
+                    if row and _json_equal(row[0], legacy):
+                        cur.execute("UPDATE policies SET rule_data = ? WHERE policy_id = ?",
+                                    (json.dumps(DEFAULT_POLICY_RULE_DATA[policy_id]), policy_id))
 
     # ==================== EVENT OPERATIONS ====================
 

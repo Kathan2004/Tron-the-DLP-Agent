@@ -27,10 +27,13 @@ from src.database import Database
 from src.event_processor import EventProcessor, EscalationEngine
 from src.file_scanner import FileContentScanner, quick_scan
 from src.incident_store import IncidentStore
-from src.rules_engine import RulesEngine
+from src.rules_engine import RulesEngine, policy_detector_name
+from src.detection import get_engine as get_detection_engine, DETECTORS
 from src.telegram_bot import DLPTelegramBot, scrub_token
 
 app = Flask(__name__)
+# Hard cap on request bodies (base64 of a 50 MB file is ~67 MB).
+app.config['MAX_CONTENT_LENGTH'] = int(os.getenv('APP_MAX_REQUEST_MB', '75')) * 1024 * 1024
 
 # Console API: only the configured console origins may call it cross-origin.
 # Unauthenticated ingest endpoints used by the browser extension's content script
@@ -386,7 +389,9 @@ def _is_public_api_request(path: str, method: str) -> bool:
         return True
     if p == '/api/browser/incident' and m == 'POST':
         return True
-    if p.startswith('/api/scan/') and m == 'POST':
+    # /api/scan/file reads paths on the API host and /api/scan/clipboard reads its clipboard:
+    # both require an authenticated console session.
+    if p.startswith('/api/scan/') and m == 'POST' and p not in {'/api/scan/file', '/api/scan/clipboard'}:
         return True
     if p.startswith('/api/browser/artifact') and m == 'POST':
         return True
@@ -1105,6 +1110,14 @@ def init_components(store, rules, processor, escalation, analyzer, classifier, b
     database = db or (store.db if hasattr(store, 'db') else None)
     file_scanner = FileContentScanner()
     _bootstrap_local_admin()
+
+
+def _policy_scanner() -> FileContentScanner | None:
+    """Shared scanner with the current console regex policies attached (cheap when unchanged)."""
+    if file_scanner and rules_engine:
+        version, rules = rules_engine.regex_policies()
+        file_scanner.set_policies(rules, version=version)
+    return file_scanner
 
 
 # ============== AUTH / RBAC ==============
@@ -2721,10 +2734,11 @@ def scan_text_endpoint():
         return jsonify({"error": "Text is required"}), 400
 
     try:
-        if not file_scanner:
+        scanner = _policy_scanner()
+        if not scanner:
             return jsonify({"error": "Scanner not initialized"}), 500
 
-        findings = file_scanner.scan_text(text, "api_scan")
+        findings = scanner.scan_text(text, "api_scan")
 
         return jsonify({
             "status": "success",
@@ -2771,10 +2785,11 @@ def scan_browser_upload():
         return jsonify({"error": "Content is required"}), 400
 
     try:
-        if not file_scanner:
+        scanner = _policy_scanner()
+        if not scanner:
             return jsonify({"error": "Scanner not initialized"}), 500
 
-        findings = file_scanner.scan_text(text, f"browser_upload:{file_name}")
+        findings = scanner.scan_text(text, f"browser_upload:{file_name}")
 
         # Determine action based on severity
         severity = "none"
@@ -2817,7 +2832,11 @@ def scan_browser_upload():
 
 @app.route('/api/scan/browser-file', methods=['POST'])
 def scan_browser_file_payload():
-    """Deep scan file bytes from browser extension (base64 payload)."""
+    """Deep scan file bytes from browser extension (base64 payload).
+
+    Extraction (true type, OCR, archives) happens once, in memory; built-in detectors and the
+    active SIEM regex policies run over the extracted text in the same pass.
+    """
     data = request.json or {}
     b64 = data.get('file_content_base64')
     file_name = data.get('file_name', 'upload.bin')
@@ -2825,105 +2844,36 @@ def scan_browser_file_payload():
     if not b64:
         return jsonify({"inspected": False, "findings": [], "error": "file_content_base64 is required"}), 400
 
-    if not file_scanner:
+    scanner = _policy_scanner()
+    if not scanner:
         return jsonify({"inspected": False, "findings": [], "error": "Scanner not initialized"}), 500
 
-    tmp_path = None
     try:
         raw = base64.b64decode(b64)
-        suffix = ''
-        if isinstance(file_name, str) and '.' in file_name:
-            suffix = '.' + file_name.split('.')[-1].lower()
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tf:
-            tf.write(raw)
-            tmp_path = tf.name
-
-        result = file_scanner.scan_file(tmp_path)
-        if not result:
+        if not raw:
             return jsonify({"inspected": False, "findings": []}), 200
-
-        findings = [f.to_dict() for f in (result.findings or [])]
-
-        # Apply active SIEM regex policies on extracted text too (including OCR-extracted image text).
-        # This ensures custom rules such as "kathan" work for browser deep scans.
-        try:
-            if database:
-                suffix = ''
-                if isinstance(file_name, str) and '.' in file_name:
-                    suffix = '.' + file_name.split('.')[-1].lower()
-
-                extracted_text = file_scanner._read_file(Path(tmp_path), suffix) if file_scanner else None
-                if extracted_text:
-                    policies = database.get_policies(active_only=True)
-                    for p in policies:
-                        if not isinstance(p, dict):
-                            continue
-                        if str(p.get('rule_type') or '').lower() != 'regex':
-                            continue
-
-                        raw_rule_data = p.get('rule_data')
-                        rule_data = raw_rule_data if isinstance(raw_rule_data, dict) else {}
-                        regex_str = p.get('regex') or rule_data.get('pattern')
-                        if not regex_str:
-                            continue
-
-                        try:
-                            compiled = re.compile(str(regex_str), re.IGNORECASE | re.MULTILINE)
-                        except re.error:
-                            continue
-
-                        for m in compiled.finditer(extracted_text):
-                            matched = (m.group(0) or '').strip()
-                            if not matched:
-                                continue
-
-                            findings.append({
-                                "pattern_name": str(p.get('name') or 'SIEM_REGEX'),
-                                "matched_text": matched,
-                                "line_number": 0,
-                                "severity": str(p.get('severity') or 'high').lower(),
-                                "confidence": 0.9,
-                                "context": matched[:120],
-                                "description": str(p.get('description') or p.get('name') or 'SIEM policy match'),
-                                "category": "SIEM Policy",
-                                "source": "siem_policy",
-                            })
-
-                    # De-duplicate merged findings.
-                    uniq = {}
-                    for f in findings:
-                        key = (
-                            str(f.get('pattern_name') or ''),
-                            str(f.get('matched_text') or ''),
-                            str(f.get('severity') or ''),
-                        )
-                        uniq[key] = f
-                    findings = list(uniq.values())
-        except Exception:
-            pass
-
-        # Recompute severity after merge.
-        severity = str(getattr(result, 'severity', 'none') or 'none')
-        if findings:
-            order = {"critical": 4, "high": 3, "medium": 2, "low": 1, "none": 0}
-            severity = max(findings, key=lambda f: order.get(str(f.get('severity') or 'none').lower(), 0)).get('severity', severity)
-
+        result, _ = scanner.scan_bytes(raw, str(file_name or 'upload.bin'))
+        findings = [f.to_dict() for f in result.findings]
+        for f in findings:
+            if f.get('source') == 'policy':
+                f['category'] = 'SIEM Policy'
+                f.setdefault('description', f.get('pattern_name'))
         return jsonify({
-            "inspected": True,
+            "inspected": not result.encrypted,
             "file_name": file_name,
-            "severity": severity,
+            "file_type": result.file_type,
+            "type_mismatch": result.type_mismatch,
+            "encrypted": result.encrypted,
+            "truncated": result.truncated,
+            "ocr_used": result.ocr_used,
+            "bulk": result.bulk,
+            "scan_ms": result.scan_ms,
+            "severity": result.severity,
             "finding_count": len(findings),
             "findings": findings,
         }), 200
     except Exception as e:
         return jsonify({"inspected": False, "findings": [], "error": str(e)}), 200
-    finally:
-        try:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
 
 
 @app.route('/api/browser/stats', methods=['GET'])
@@ -4217,6 +4167,15 @@ def sync_policies():
     return jsonify({"patterns": patterns, "managed_settings": managed_settings}), 200
 
 
+@app.route('/api/detectors', methods=['GET'])
+def list_detectors():
+    """Built-in detector catalogue (for policy authoring in the console)."""
+    return jsonify({"detectors": [
+        {k: d.get(k) for k in ("name", "description", "category", "severity", "validator", "keywords", "require_keyword")}
+        for d in DETECTORS
+    ]}), 200
+
+
 @app.route('/api/exceptions', methods=['GET'])
 def get_exceptions():
     """Get exception rules."""
@@ -4508,10 +4467,15 @@ def create_policy():
     regex_pattern = (data.get('regex_pattern') or data.get('pattern') or '').strip()
 
     if rule_type == 'regex':
+        detector = str(data.get('detector') or rule_data.get('detector') or '').strip().upper()
+        if detector:
+            if not policy_detector_name({'detector': detector}):
+                return jsonify({"error": f"Unknown detector: {detector}", "detectors": get_detection_engine().detector_names}), 400
+            rule_data['detector'] = policy_detector_name({'detector': detector})
         if not rule_data.get('pattern'):
             rule_data['pattern'] = regex_pattern
-        if not rule_data.get('pattern'):
-            return jsonify({"error": "Pattern is required for regex rule"}), 400
+        if not rule_data.get('pattern') and not rule_data.get('detector'):
+            return jsonify({"error": "Pattern or detector is required for regex rule"}), 400
 
     elif rule_type == 'extension':
         blocked = rule_data.get('blocked_extensions') if isinstance(rule_data.get('blocked_extensions'), list) else []
@@ -4549,6 +4513,8 @@ def create_policy():
             threshold_window_mins=data.get('threshold_window_mins', 60),
             actor=actor
         )
+        if rules_engine:
+            rules_engine.invalidate()
         return jsonify({"status": "success", "policy_id": policy_id}), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -4563,6 +4529,8 @@ def update_policy(policy_id):
     try:
         actor = _actor_from_request('admin')
         success = database.update_policy(policy_id, actor=actor, **data)
+        if rules_engine:
+            rules_engine.invalidate()
         if success:
             return jsonify({"status": "success"}), 200
         return jsonify({"error": "Failed to update or no changes"}), 400
@@ -4583,6 +4551,8 @@ def delete_policy(policy_id):
             if not ticket:
                 return jsonify({'error': 'ticket_id_required_for_delete'}), 400
         database.delete_policy(policy_id)
+        if rules_engine:
+            rules_engine.invalidate()
         return jsonify({"status": "success"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500

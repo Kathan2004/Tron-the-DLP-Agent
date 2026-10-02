@@ -34,16 +34,30 @@ All agents check in to the API (fleet heartbeat) and post events to `/api/events
 ## Detection pipeline
 
 ```
-content ──► regex rules + Luhn check ──► text extraction / OCR ──► redaction ──► LLM triage ──► incident + alert
-            (SSN, cards, keys, PII…)     (PDF, DOCX, XLSX, images)                (FP probability,
-                                                                                    risk score, verdict)
+content ──► true file type ──► extraction / OCR ──► normalize ──► 47 detectors ──► validators ──► keyword context ──► EDM ──► redaction ──► LLM triage ──► incident + alert
+            (magic bytes)      PDF, Office, ODF,     NFKC, strip    (PII, financial,  Luhn+IIN,      proximity                     before any     FP probability,
+                               RTF, email, zip/tar,  zero-width,    secrets, health,  Verhoeff,      window                        external call  risk score
+                               images (Tesseract)    base64 decode  classification)   mod-97, ...
 ```
 
-1. **Pattern matching**: built-in regex rules (identity numbers, credit cards, cloud keys, tokens, secrets, contact data) plus policies created in the console. Card-like numbers are validated with the Luhn algorithm to cut false positives.
-2. **Extraction and OCR**: PDF (PyPDF2, OCR fallback via pdf2image + Tesseract), DOCX, XLSX and images (Tesseract). Docling is used when installed for richer document extraction.
-3. **Redaction**: before anything is sent to an external LLM, every pattern match and Luhn-valid card number is replaced with a typed placeholder such as `[REDACTED:SSN]`.
-4. **LLM triage** (Gemini): returns a false-positive probability, risk score, verdict (`LIKELY_THREAT` / `LIKELY_FP` / `NEEDS_REVIEW`) and recommended action. Without an API key the system falls back to a neutral "needs review" result.
-5. **Incidents and alerting**: events are correlated into incidents (threshold within a time window), stored in SQLite, pushed to the console, and alerted to Telegram (with inline actions). Slack and Jira escalation are optional.
+1. **True type and extraction** (`src/extraction.py`): magic bytes pick the parser, so renamed files are still inspected. PDF text via PDFium, with page-level OCR only for scanned pages; Office/OpenDocument including headers, footers, comments, notes and numeric cells; archives and email attachments recursively with zip-bomb limits; encrypted files reported explicitly.
+2. **Detection** (`src/detection/`): 47 data identifiers with checksum validators (Luhn + issuer ranges, Verhoeff, IBAN mod-97, SSN rules, ABA, GSTIN, JWT), keyword proximity, Unicode/zero-width/base64 evasion handling, and overlap resolution so one value yields one finding. 20 of them cover credentials (GitHub, GitLab, Slack, Stripe, Google, Azure, OpenAI, Anthropic, private keys, credentialed connection strings, entropy-checked generic secrets).
+3. **Exact Data Match**: optional hashed index of protected records (for example the customer table); a match needs several fields of the same record, not just something that looks like an SSN.
+4. **Policies**: console policies are either custom regexes or references to validated built-in detectors. Files with 10+ identity/financial findings escalate to critical (bulk exposure).
+5. **Redaction and LLM triage** (Gemini): every detected value is replaced with `[REDACTED:<TYPE>]` before the prompt is built. The model returns a false-positive probability, risk score and verdict; without an API key the system falls back to "needs review".
+6. **Incidents and alerting**: events are correlated per policy threshold and window, stored in SQLite, streamed to the console and sent to Telegram (with inline actions). Slack and Jira escalation are optional.
+
+The browser extension runs the same detector library (generated from the Python source and parity-tested in CI).
+
+**Measured against the previous version** (details and method in [docs/detection.md](docs/detection.md)):
+
+| | Before | Now |
+|---|---|---|
+| False positives on 2.1 MB of unseen text (excluding emails) | 2,078 | 3 |
+| Text scan, 1 MB | 528 ms | 177 ms |
+| 10-page PDF extraction | 149 ms (Docling: 8 s warm) | 12 ms |
+| Image OCR | 1.96 s | 0.14 s |
+| Install size / peak memory with Docling | 6.3 GB / 2.4 GB | 83 MB / 44 MB |
 
 ## Architecture
 
@@ -58,8 +72,8 @@ flowchart LR
 
     subgraph Server["Tron API (Flask)"]
         API[REST API<br/>auth + RBAC]
-        RE[Rules engine<br/>regex + Luhn]
-        FS[File scanner<br/>OCR + extraction]
+        RE[Rules engine<br/>policies + validated detectors]
+        FS[Extraction + detection<br/>true type, OCR, EDM]
         RED[Redaction]
         EP[Event processor<br/>incident correlation]
     end
@@ -96,7 +110,7 @@ $EDITOR .env               # fill in the variables below
 ./start_all.sh             # API + endpoint, network and web agents
 ```
 
-OCR needs system packages: `tesseract` and `poppler` (`brew install tesseract poppler` or `apt install tesseract-ocr poppler-utils`).
+OCR needs the Tesseract binary (`brew install tesseract` or `apt install tesseract-ocr`). Without it, images and scanned PDFs are reported as not inspected; everything else works.
 
 Open the console at http://localhost:5173. On first start, if `APP_ADMIN_PASSWORD` is not set, the API prints a one-time admin password and forces a change at first login.
 
@@ -129,6 +143,9 @@ Run the console separately with `cd siem-console && npm install && npm run dev`.
 | `JIRA_SERVER` / `JIRA_USER` / `JIRA_TOKEN` | No | Jira ticket creation on escalation. |
 | `NGROK_DOMAIN` | No | `./start` only: expose the API through an ngrok reserved domain. |
 | `VITE_API_BASE` | No | Console build-time API base URL (default `http://127.0.0.1:5001/api`). |
+| `APP_MAX_REQUEST_MB` | No | Maximum request body size (default 75 MB, enough for a base64-encoded 50 MB file). |
+| `TRON_BULK_THRESHOLD` | No | Identity/financial findings in one file that escalate it to critical (default 10). |
+| `TRON_EDM_DIR` / `TRON_EDM_KEY` | No | Exact Data Match index directory (default `data/edm`) and HMAC key (default: `data/edm/.key`, created on first build). |
 
 ### Load the Chrome extension
 
@@ -138,11 +155,22 @@ Run the console separately with `cd siem-console && npm install && npm run dev`.
 
 ## Security notes
 
-- **Redaction before any external LLM call.** Server-side triage and rule generation pass all text through `redact_for_llm` (`src/file_scanner.py`); the extension masks regex matches in file text and findings before calling Gemini. Limitation: when the extension's optional AI mode is enabled with a Gemini key, **image** uploads are sent to Gemini unredacted for OCR.
+- **Redaction before any external LLM call.** Server-side triage and rule generation pass all text through `redact_for_llm`, which runs the full detector library with keyword requirements ignored (over-redaction is the safe failure); the extension masks detector matches in file text and findings before calling Gemini. Limitation: when the extension's optional AI mode is enabled with a Gemini key, **image** uploads are sent to Gemini unredacted for OCR.
 - **Local storage keeps matched values.** Findings in the local SQLite database include the matched text so analysts can review them. Protect the `data/` directory accordingly.
 - **Auth model.** Console users authenticate with email and password (PBKDF2-SHA256, 200k iterations). Successful login creates a server-side session and returns a signed, time-limited bearer token (`itsdangerous`, default TTL 8h). Every request re-checks the session: revocation, expiry, idle timeout (default 120 min), and a cap on concurrent sessions. Repeated failed logins lock the account. Roles: `SUPER_ADMIN`, `SECURITY_ADMIN`, `SOC_ANALYST`, `VIEWER`, with per-permission RBAC and custom roles. Accounts flagged for a password change can only use self-service auth endpoints until they change it.
+- **Server-side scans require a session.** `/api/scan/file` (reads paths on the API host) and `/api/scan/clipboard` require console authentication; request bodies are capped by `APP_MAX_REQUEST_MB`.
 - **CORS.** Console APIs only accept the origins in `APP_CORS_ORIGINS`. The unauthenticated ingest endpoints used by the extension's content script (`/api/browser/*`, `/api/scan/*`) accept any origin.
 - **No real data is committed.** Databases, captured artifacts, logs, `.env` and service account keys are git-ignored. `.env.example` contains placeholders only.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q                       # 62 tests; OCR tests skip if tesseract is missing
+python scripts/benchmark_detection.py     # precision/recall + latency
+```
+
+CI (`.github/workflows/ci.yml`) runs the tests, the benchmark, the extension parity check, the console build and a manifest check on every push.
 
 ## Screenshots
 
@@ -154,7 +182,10 @@ Screenshots will live in [`docs/screenshots/`](docs/screenshots/).
 - [ ] Agent authentication (per-agent keys) for ingest endpoints
 - [ ] Windows endpoint agent
 - [ ] Encrypted-at-rest findings and artifact retention policies
-- [ ] Automated tests and CI
+- [ ] Indexed Document Matching (fingerprints of specific protected documents)
+- [x] Validated detectors, keyword context, evasion handling, Exact Data Match
+- [x] Lightweight extraction (Docling removed), archives, encrypted-file detection
+- [x] Automated tests and CI
 - [ ] Published extension build as a GitHub Release asset
 
 ## Project layout
@@ -165,6 +196,11 @@ browser-extension/  Chrome MV3 extension
 config/             settings (service-account.json goes here, git-ignored)
 siem-console/       React/Vite admin console
 src/                Flask API, rules engine, scanners, Telegram bot, database
+src/detection/      detector library, validators, engine, Exact Data Match
+src/extraction.py   true-type detection, PDF/Office/archive/email extraction, OCR
+scripts/            benchmark, extension detector generator
+tests/              pytest suite (detection, extraction, rules engine, API, extension parity)
+docs/               detection design, benchmarks, gap analysis
 main.py             API entry point
 start / stop        API + console (+ optional ngrok)
 start_all.sh / stop_all.sh   API + all agents

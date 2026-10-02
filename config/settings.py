@@ -2,8 +2,8 @@ import os
 from dotenv import load_dotenv
 from pathlib import Path
 
-# Load .env from the project root
-env_path = Path(__file__).parent.parent / ".env"
+# Load .env from the project root (TRON_ENV_FILE overrides the path, e.g. for tests)
+env_path = Path(os.getenv("TRON_ENV_FILE") or Path(__file__).parent.parent / ".env")
 load_dotenv(dotenv_path=env_path, override=True)
 
 class Config:
