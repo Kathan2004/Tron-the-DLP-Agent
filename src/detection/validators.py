@@ -225,6 +225,92 @@ def url_credentials(value: str) -> bool:
     return pw.lower() not in _PLACEHOLDER_PASSWORDS and not _PLACEHOLDER.search(pw)
 
 
+def luhn_any(value: str) -> bool:
+    """Luhn (mod 10) check on any digit string of length >= 2 (IMEI, loyalty cards, custom IDs)."""
+    d = digits_only(value)
+    if len(d) < 2:
+        return False
+    total = 0
+    for i, ch in enumerate(reversed(d)):
+        n = ord(ch) - 48
+        if i % 2 == 1:
+            n *= 2
+            if n > 9:
+                n -= 9
+        total += n
+    return total % 10 == 0
+
+
+def iso7064_mod97(value: str) -> bool:
+    """ISO 7064 MOD 97-10 over the alphanumeric string (letters as A=10..Z=35); remainder must be 1."""
+    s = _NON_ALNUM.sub("", value or "").upper()
+    if len(s) < 3:
+        return False
+    rem = 0
+    for ch in s:
+        v = int(ch, 36)
+        rem = (rem * (100 if v > 9 else 10) + v) % 97
+    return rem == 1
+
+
+def iso7064_mod11_2(value: str) -> bool:
+    """ISO 7064 MOD 11-2 (last character 0-9 or X), e.g. Chinese resident identity numbers."""
+    s = _NON_ALNUM.sub("", value or "").upper()
+    if len(s) < 2 or not s[:-1].isdigit() or not (s[-1].isdigit() or s[-1] == "X"):
+        return False
+    total = 0
+    for i, ch in enumerate(s[:-1]):
+        total += int(ch) * pow(2, len(s) - 1 - i, 11)
+    check = (12 - total % 11) % 11
+    return s[-1] == ("X" if check == 10 else str(check))
+
+
+def uk_nhs(value: str) -> bool:
+    """UK NHS number: 10 digits, weighted mod 11 (weights 10..2)."""
+    d = digits_only(value)
+    if len(d) != 10 or len(set(d)) == 1:
+        return False
+    check = 11 - sum(int(x) * w for x, w in zip(d[:9], range(10, 1, -1))) % 11
+    check = 0 if check == 11 else check
+    return check != 10 and check == int(d[9])
+
+
+def br_cpf(value: str) -> bool:
+    """Brazilian CPF: 11 digits with two mod-11 check digits."""
+    d = digits_only(value)
+    if len(d) != 11 or len(set(d)) == 1:
+        return False
+    for n in (9, 10):
+        total = sum(int(d[i]) * (n + 1 - i) for i in range(n))
+        check = (total * 10) % 11 % 10
+        if check != int(d[n]):
+            return False
+    return True
+
+
+_DNI_LETTERS = "TRWAGMYFPDXBNJZSQVHLCKE"
+
+
+def es_dni(value: str) -> bool:
+    """Spanish DNI (8 digits + letter) or NIE (X/Y/Z + 7 digits + letter), mod-23 letter."""
+    s = _NON_ALNUM.sub("", value or "").upper()
+    if len(s) != 9:
+        return False
+    head = s[:8]
+    if head[0] in "XYZ":
+        head = str("XYZ".index(head[0])) + head[1:]
+    return head.isdigit() and _DNI_LETTERS[int(head) % 23] == s[8]
+
+
+def au_tfn(value: str) -> bool:
+    """Australian Tax File Number: 9 digits, weighted mod 11."""
+    d = digits_only(value)
+    if len(d) != 9:
+        return False
+    weights = (1, 4, 3, 7, 5, 8, 6, 9, 10)
+    return sum(int(x) * w for x, w in zip(d, weights)) % 11 == 0
+
+
 VALIDATORS = {
     "luhn": luhn,
     "payment_card": payment_card,
@@ -238,4 +324,37 @@ VALIDATORS = {
     "not_placeholder": not_placeholder,
     "high_entropy_secret": high_entropy_secret,
     "url_credentials": url_credentials,
+    "luhn_any": luhn_any,
+    "verhoeff": verhoeff,
+    "iso7064_mod97": iso7064_mod97,
+    "iso7064_mod11_2": iso7064_mod11_2,
+    "uk_nhs": uk_nhs,
+    "br_cpf": br_cpf,
+    "es_dni": es_dni,
+    "au_tfn": au_tfn,
+}
+
+# Human-readable catalogue (console, API). Generic validators are the building blocks for
+# custom detectors; the rest are tied to one identifier format.
+VALIDATOR_INFO = {
+    "luhn": "Luhn mod-10 checksum, 12-19 digits",
+    "luhn_any": "Luhn mod-10 checksum, any length (IMEI, loyalty and custom account numbers)",
+    "payment_card": "Luhn + issuer prefix and length (Visa, Mastercard, Amex, Discover, JCB, Diners, UnionPay, Maestro, RuPay)",
+    "verhoeff": "Verhoeff checksum (dihedral group D5)",
+    "aadhaar": "Verhoeff + Aadhaar structure (12 digits, first digit 2-9)",
+    "iso7064_mod97": "ISO 7064 MOD 97-10 over alphanumerics (remainder 1)",
+    "iban": "IBAN: country-specific length + ISO 7064 MOD 97-10",
+    "iso7064_mod11_2": "ISO 7064 MOD 11-2 (check character 0-9 or X)",
+    "us_ssn": "US SSN area/group/serial rules (no 000/666/9xx areas, no 00 group, no 0000 serial)",
+    "aba_routing": "US ABA routing number weighted checksum (3-7-1)",
+    "ca_sin": "Canadian SIN Luhn checksum (9 digits)",
+    "uk_nhs": "UK NHS number weighted mod 11",
+    "br_cpf": "Brazilian CPF two mod-11 check digits",
+    "es_dni": "Spanish DNI/NIE mod-23 control letter",
+    "au_tfn": "Australian Tax File Number weighted mod 11",
+    "gstin": "Indian GSTIN base-36 checksum character",
+    "jwt": "JWT header decodes to JSON with an alg field",
+    "not_placeholder": "Rejects placeholders (changeme, your-..., <...>, ${VAR}) and values under 6 chars",
+    "high_entropy_secret": "Secret-like: >= 16 chars, mixed charset, Shannon entropy >= 3.5, not a placeholder or identifier",
+    "url_credentials": "URL with user:password@ where the password is not a placeholder",
 }

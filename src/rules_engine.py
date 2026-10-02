@@ -37,12 +37,14 @@ class DetectionResult:
     confidence: float
 
 
-def policy_detector_name(rule_data: dict) -> Optional[str]:
-    """Built-in detector referenced by a policy, or None."""
+def policy_detector_name(rule_data: dict, detector_store=None) -> Optional[str]:
+    """Detector (built-in or custom) referenced by a policy, or None."""
     name = str((rule_data or {}).get("detector") or "").strip().upper()
     if not name:
         return None
     name = LEGACY_ALIASES.get(name, name)
+    if detector_store is not None:
+        return name if name in {d["name"] for d in detector_store.detectors()} else None
     return name if get_engine().detector(name) else None
 
 
@@ -51,6 +53,7 @@ class RulesEngine:
 
     def __init__(self):
         self.db: Optional[Any] = None
+        self.detector_store = None   # DetectorConfigStore (console overrides + custom detectors)
         self.rules: Dict = {}
         self._lock = threading.Lock()
         self._loaded_at = 0.0
@@ -81,7 +84,8 @@ class RulesEngine:
             if self._compiled is not None and time.monotonic() - self._loaded_at < POLICY_TTL:
                 return
             policies = self._active_policies()
-            signature = tuple(sorted(
+            store_version = self.detector_store.refresh() if self.detector_store is not None else None
+            signature = (store_version,) + tuple(sorted(
                 (str(p.get("policy_id")), str(p.get("name")), str(p.get("rule_data")), str(p.get("severity")),
                  str(p.get("threshold_count")), str(p.get("threshold_window_mins")), str(p.get("updated_at")))
                 for p in policies))
@@ -93,7 +97,7 @@ class RulesEngine:
                     if not name:
                         continue
                     severity = str(p.get("severity") or "medium").lower()
-                    detector = policy_detector_name(rule_data)
+                    detector = policy_detector_name(rule_data, self.detector_store)
                     pattern = rule_data.get("pattern") or p.get("regex_pattern") or ""
                     if not detector and not pattern:
                         continue
@@ -110,7 +114,7 @@ class RulesEngine:
                         detector_policies.setdefault(detector, []).append(name)
                     else:
                         custom.append({"name": _POLICY_PREFIX + name, "pattern": pattern, "severity": severity})
-                engine = DetectionEngine()
+                engine = DetectionEngine(self.detector_store.effective_detectors()) if self.detector_store is not None else DetectionEngine()
                 failed = engine.set_custom_rules(custom)
                 for name in failed:
                     print(f"Invalid regex in rule {name[len(_POLICY_PREFIX):]}")

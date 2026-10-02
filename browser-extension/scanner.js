@@ -157,17 +157,102 @@ function validHighEntropySecret(value) {
     return classes >= 2 && tronEntropy(v) >= 3.5;
 }
 
+function validLuhnAny(value) {
+    const d = tronDigits(value);
+    if (d.length < 2) return false;
+    let sum = 0;
+    for (let i = 0; i < d.length; i++) {
+        let n = d.charCodeAt(d.length - 1 - i) - 48;
+        if (i % 2 === 1) { n *= 2; if (n > 9) n -= 9; }
+        sum += n;
+    }
+    return sum % 10 === 0;
+}
+
+function validVerhoeff(value) {
+    const d = tronDigits(value);
+    if (!d) return false;
+    let c = 0;
+    for (let i = 0; i < d.length; i++) c = TRON_VD[c][TRON_VP[i % 8][d.charCodeAt(d.length - 1 - i) - 48]];
+    return c === 0;
+}
+
+function validMod97(value) {
+    const s = String(value || "").replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+    if (s.length < 3) return false;
+    let rem = 0;
+    for (const ch of s) { const v = parseInt(ch, 36); rem = (rem * (v > 9 ? 100 : 10) + v) % 97; }
+    return rem === 1;
+}
+
+function validMod11_2(value) {
+    const s = String(value || "").replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+    if (s.length < 2 || !/^\d+$/.test(s.slice(0, -1)) || !/[\dX]/.test(s.slice(-1))) return false;
+    let total = 0;
+    for (let i = 0; i < s.length - 1; i++) {
+        let w = 1;
+        for (let k = 0; k < s.length - 1 - i; k++) w = (w * 2) % 11;
+        total += (s.charCodeAt(i) - 48) * w;
+    }
+    const check = (12 - (total % 11)) % 11;
+    return s.slice(-1) === (check === 10 ? "X" : String(check));
+}
+
+function validUkNhs(value) {
+    const d = tronDigits(value);
+    if (d.length !== 10 || new Set(d).size === 1) return false;
+    let total = 0;
+    for (let i = 0; i < 9; i++) total += (d.charCodeAt(i) - 48) * (10 - i);
+    let check = 11 - (total % 11);
+    if (check === 11) check = 0;
+    return check !== 10 && check === d.charCodeAt(9) - 48;
+}
+
+function validBrCpf(value) {
+    const d = tronDigits(value);
+    if (d.length !== 11 || new Set(d).size === 1) return false;
+    for (const n of [9, 10]) {
+        let total = 0;
+        for (let i = 0; i < n; i++) total += (d.charCodeAt(i) - 48) * (n + 1 - i);
+        if (((total * 10) % 11) % 10 !== d.charCodeAt(n) - 48) return false;
+    }
+    return true;
+}
+
+function validEsDni(value) {
+    const s = String(value || "").replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+    if (s.length !== 9) return false;
+    let head = s.slice(0, 8);
+    if ("XYZ".includes(head[0])) head = String("XYZ".indexOf(head[0])) + head.slice(1);
+    return /^\d{8}$/.test(head) && "TRWAGMYFPDXBNJZSQVHLCKE"[parseInt(head, 10) % 23] === s[8];
+}
+
+function validAuTfn(value) {
+    const d = tronDigits(value);
+    if (d.length !== 9) return false;
+    const w = [1, 4, 3, 7, 5, 8, 6, 9, 10];
+    let total = 0;
+    for (let i = 0; i < 9; i++) total += (d.charCodeAt(i) - 48) * w[i];
+    return total % 11 === 0;
+}
+
 const TRON_VALIDATORS = {
     luhn: isValidLuhn, payment_card: validPaymentCard, aadhaar: validAadhaar, iban: validIban,
     us_ssn: validUsSsn, aba_routing: validAbaRouting, ca_sin: validCaSin, gstin: validGstin,
     jwt: validJwt, not_placeholder: validNotPlaceholder, high_entropy_secret: validHighEntropySecret,
-    url_credentials: validUrlCredentials,
+    url_credentials: validUrlCredentials, luhn_any: validLuhnAny, verhoeff: validVerhoeff,
+    iso7064_mod97: validMod97, iso7064_mod11_2: validMod11_2, uk_nhs: validUkNhs, br_cpf: validBrCpf,
+    es_dni: validEsDni, au_tfn: validAuTfn,
 };
 
 // ─── Built-in detectors ──────────────────────────────────────────
 function tronEscapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\\/]/g, "\\$&"); }
 
 function tronCompileDetector(d) {
+    if (d.validator && !TRON_VALIDATORS[d.validator]) {
+        // Never run a detector without the validator it depends on (newer server config).
+        throw new Error(`unknown validator ${d.validator}`);
+    }
     const keywords = (d.keywords || []).map(k => k.toLowerCase());
     const prefilter = d.prefilter || null;
     return {
@@ -197,6 +282,46 @@ for (const d of TRON_DETECTORS) TRON_BUILTINS[d.name] = tronCompileDetector(d);
 
 // Built-in detectors + dynamic SIEM policies (see updatePatterns).
 let SENSITIVE_PATTERNS = Object.assign({}, TRON_BUILTINS);
+
+let TRON_DETECTOR_CONFIG_VERSION = null;
+
+/**
+ * Apply console detector configuration from policy sync:
+ * { version, overrides: {NAME: {enabled, severity, confidence, keywords, ...}}, custom: [definition...] }
+ */
+function applyDetectorConfig(cfg) {
+    if (!cfg || typeof cfg !== 'object') return;
+    if (cfg.version && cfg.version === TRON_DETECTOR_CONFIG_VERSION) return;
+    const overrides = (cfg.overrides && typeof cfg.overrides === 'object') ? cfg.overrides : {};
+    const next = {};
+    for (const d of TRON_DETECTORS) {
+        const merged = Object.assign({}, d, overrides[d.name] || {});
+        if (merged.enabled === false) continue;
+        try {
+            next[d.name] = tronCompileDetector(merged);
+        } catch (err) {
+            console.warn(`TRON THE DLP AGENT: override for ${d.name} rejected, using default:`, err.message);
+            next[d.name] = tronCompileDetector(d);
+        }
+    }
+    for (const c of (Array.isArray(cfg.custom) ? cfg.custom : [])) {
+        if (!c || !c.name || TRON_DETECTORS.some(d => d.name === c.name)) continue;
+        try {
+            next[c.name] = tronCompileDetector(c);
+        } catch (err) {
+            console.warn(`TRON THE DLP AGENT: custom detector ${c.name} skipped:`, err.message);
+        }
+    }
+    for (const [k, v] of Object.entries(SENSITIVE_PATTERNS)) {
+        if (v && v.__builtin) delete SENSITIVE_PATTERNS[k];
+    }
+    for (const k of Object.keys(TRON_BUILTINS)) delete TRON_BUILTINS[k];
+    Object.assign(TRON_BUILTINS, next);
+    for (const [k, v] of Object.entries(next)) {
+        if (!SENSITIVE_PATTERNS[k] || SENSITIVE_PATTERNS[k].__builtin) SENSITIVE_PATTERNS[k] = v;
+    }
+    TRON_DETECTOR_CONFIG_VERSION = cfg.version || null;
+}
 
 // File types we can scan as text
 const SCANNABLE_EXTENSIONS = new Set([
@@ -368,7 +493,7 @@ function tronDecodedCandidates(text, ignoreKeyword) {
 }
 
 function tronPriority(f) {
-    return [f.generic ? 0 : 1, f.validated ? 1 : 0, TRON_SEVERITY_RANK[f.severity] || 0, f.confidence || 0, f.end - f.start];
+    return [f.generic ? 0 : 1, f.validated ? 1 : 0, f.end - f.start, TRON_SEVERITY_RANK[f.severity] || 0, f.confidence || 0];
 }
 
 function tronResolveOverlaps(cands) {
@@ -761,6 +886,7 @@ if (typeof globalThis !== "undefined") {
         scanFiles,
         redactMatch,
         updatePatterns,
+        applyDetectorConfig,
         SENSITIVE_PATTERNS,
         SCANNABLE_EXTENSIONS,
     };

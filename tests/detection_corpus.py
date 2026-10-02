@@ -99,6 +99,14 @@ for code, bban in [("GB", "WEST12345698765432"), ("DE", "370400440532013000"), (
     iban = _iban(code, bban)
     case(f"Wire to IBAN {_group(iban)}", "IBAN")
     case(f"iban:{iban}", "IBAN")
+case("NHS number 943 476 5919 on referral", "UK_NHS_NUMBER")
+case("CPF do cliente: 529.982.247-25", "BR_CPF")
+case("DNI 12345678Z presentado", "ES_DNI")
+case("TFN: 123 456 782 lodged", "AU_TFN")
+case("resident id 11010519491231002X", "CN_RESIDENT_ID")
+case("device IMEI 490154203237518 reported lost", "IMEI")
+case("ticket 9434765919 closed")                                  # NHS-valid digits, no keyword
+case("serial 490154203237518 shipped")                            # Luhn-valid, no keyword
 case("PAN: ABCPE1234F (income tax)", "IN_PAN")
 case("Vendor PAN AAACR5055K on file", "IN_PAN")
 case("passport number K1234567 issued 2019", "PASSPORT")

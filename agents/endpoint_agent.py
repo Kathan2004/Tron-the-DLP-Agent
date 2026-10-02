@@ -28,6 +28,7 @@ from typing import List, Dict, Optional, Any
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.file_scanner import FileContentScanner
+from src.detection.config import DetectorConfigStore
 from src.network_monitor import NetworkMonitor, ProcessMonitor, ShellHistoryScanner, BrowserHistoryScanner
 from src.file_watcher import USBMonitor
 from src.database import Database
@@ -45,7 +46,6 @@ class EndpointDLPAgent:
         self.active_policies = []
 
         # Real monitors
-        self.file_scanner = FileContentScanner()
         self.network_monitor = NetworkMonitor()
         self.process_monitor = ProcessMonitor()
         self.usb_monitor = USBMonitor()
@@ -54,6 +54,8 @@ class EndpointDLPAgent:
 
         # Local database
         self.db = Database()
+        # Same detector library as the console (overrides + custom detectors from the local DB).
+        self.file_scanner = FileContentScanner(detector_store=DetectorConfigStore(self.db))
 
         # State tracking
         self._last_clipboard = ""

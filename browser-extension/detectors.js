@@ -346,6 +346,151 @@ const TRON_DETECTORS = [
     "description": "Indian voter ID / EPIC (keyword required)"
   },
   {
+    "name": "UK_NHS_NUMBER",
+    "pattern": "\\d(?<!\\w\\d)\\d{2}[ -]?\\d{3}[ -]?\\d{4}\\b",
+    "validator": "uk_nhs",
+    "keywords": [
+      "nhs",
+      "national health",
+      "patient"
+    ],
+    "require_keyword": true,
+    "prefilter": [
+      "0",
+      "1",
+      "2",
+      "3",
+      "4",
+      "5",
+      "6",
+      "7",
+      "8",
+      "9"
+    ],
+    "severity": "high",
+    "confidence": 0.85,
+    "category": "Health",
+    "description": "UK NHS number (mod 11 validated, keyword required)"
+  },
+  {
+    "name": "BR_CPF",
+    "pattern": "\\d(?<!\\w\\d)\\d{2}\\.\\d{3}\\.\\d{3}-\\d{2}\\b",
+    "validator": "br_cpf",
+    "keywords": [
+      "cpf",
+      "cadastro"
+    ],
+    "prefilter": [
+      "0",
+      "1",
+      "2",
+      "3",
+      "4",
+      "5",
+      "6",
+      "7",
+      "8",
+      "9"
+    ],
+    "severity": "critical",
+    "confidence": 0.9,
+    "category": "PII",
+    "description": "Brazilian CPF (two mod-11 check digits)"
+  },
+  {
+    "name": "ES_DNI",
+    "pattern": "[0-9XYZ](?<!\\w[0-9XYZ])\\d{7}-?[A-Z]\\b",
+    "validator": "es_dni",
+    "keywords": [
+      "dni",
+      "nie",
+      "nif",
+      "documento"
+    ],
+    "severity": "high",
+    "confidence": 0.85,
+    "category": "PII",
+    "description": "Spanish DNI / NIE (mod-23 control letter)"
+  },
+  {
+    "name": "AU_TFN",
+    "pattern": "\\d(?<!\\w\\d)\\d{2}[ -]?\\d{3}[ -]?\\d{3}\\b",
+    "validator": "au_tfn",
+    "keywords": [
+      "tfn",
+      "tax file"
+    ],
+    "require_keyword": true,
+    "prefilter": [
+      "0",
+      "1",
+      "2",
+      "3",
+      "4",
+      "5",
+      "6",
+      "7",
+      "8",
+      "9"
+    ],
+    "severity": "critical",
+    "confidence": 0.85,
+    "category": "PII",
+    "description": "Australian Tax File Number (mod 11, keyword required)"
+  },
+  {
+    "name": "CN_RESIDENT_ID",
+    "pattern": "[1-9](?<!\\w[1-9])\\d{5}(?:19|20)\\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\\d|3[01])\\d{3}[\\dX]\\b",
+    "validator": "iso7064_mod11_2",
+    "keywords": [
+      "id card",
+      "resident",
+      "\u8eab\u4efd\u8bc1"
+    ],
+    "prefilter": [
+      "0",
+      "1",
+      "2",
+      "3",
+      "4",
+      "5",
+      "6",
+      "7",
+      "8",
+      "9"
+    ],
+    "severity": "critical",
+    "confidence": 0.92,
+    "category": "PII",
+    "description": "Chinese resident identity number (ISO 7064 MOD 11-2)"
+  },
+  {
+    "name": "IMEI",
+    "pattern": "\\d(?<!\\w\\d)\\d{14}\\b",
+    "validator": "luhn_any",
+    "keywords": [
+      "imei",
+      "device id"
+    ],
+    "require_keyword": true,
+    "prefilter": [
+      "0",
+      "1",
+      "2",
+      "3",
+      "4",
+      "5",
+      "6",
+      "7",
+      "8",
+      "9"
+    ],
+    "severity": "medium",
+    "confidence": 0.85,
+    "category": "PII",
+    "description": "Mobile device IMEI (Luhn, keyword required)"
+  },
+  {
     "name": "EMAIL_ADDRESS",
     "pattern": "\\b[A-Za-z0-9._%+-]{1,64}@(?:[A-Za-z0-9-]{1,63}\\.)+[A-Za-z]{2,24}\\b",
     "prefilter": [

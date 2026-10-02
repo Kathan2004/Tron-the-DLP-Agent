@@ -91,29 +91,30 @@ Respond with ONLY this JSON (no extra text):
     def generate_rule_from_prompt(self, user_prompt: str) -> Dict:
         """Convert a natural language prompt into a structured DLP rule."""
         
-        system_instructions = """You are a DLP Security Architect. Convert the user's natural language request into a JSON DLP rule.
-Supported Rule Types:
-1. 'regex': For text patterns (PII, secrets, etc.)
-2. 'file_size': For blocking/monitoring large files. Parameters: 'max_size_mb' (int)
-3. 'extension': For forbidden file types. Parameters: 'blocked_extensions' (list of strings)
-4. 'network': For risky domains/IPs. Parameters: 'blocked_domains' (list)
+        from src.detection.library import DETECTORS
+        from src.detection.validators import VALIDATOR_INFO
+        validators = "\n".join(f"   - {k}: {v}" for k, v in VALIDATOR_INFO.items())
+        builtins = ", ".join(d["name"] for d in DETECTORS)
+        system_instructions = f"""You are a DLP Security Architect. Convert the user's natural language request into a JSON DLP rule.
+Supported rule types:
+1. 'builtin': the request matches an existing validated detector. rule_data: {{"detector": "NAME"}}
+   Built-in detectors: {builtins}
+2. 'detector': a NEW identifier format that needs a checksum or context. rule_data:
+   {{"pattern": "regex (no inline flags, no named groups)", "validator": "one of the validators or null",
+     "keywords": ["context words"], "require_keyword": true|false, "ignore_case": true|false}}
+   Validators:
+{validators}
+3. 'regex': a plain keyword / phrase / code-name match. rule_data: {{"pattern": "regex"}}
+4. 'file_size': rule_data {{"max_size_mb": 10}}
+5. 'extension': rule_data {{"blocked_extensions": [".exe", ".zip"]}}
+6. 'network': rule_data {{"blocked_domains": ["risky.site"]}}
 
-Respond ONLY with JSON:
-{
-  "name": "SHORT_UPPERCASE_NAME",
-  "description": "Clear description of what this rule does",
-  "rule_type": "regex|file_size|extension|network",
-  "rule_data": { 
-     // for regex: {"pattern": "..."}
-     // for file_size: {"max_size_mb": 10}
-     // for extension: {"blocked_extensions": [".exe", ".zip"]}
-     // for network: {"blocked_domains": ["risky.site"]}
-  },
-  "severity": "LOW|MEDIUM|HIGH|CRITICAL",
-  "action": "monitor|warn|block"
-}
+Prefer 'builtin' when one fits. Use 'detector' with a validator whenever the format has a check digit
+(Luhn, Verhoeff, mod 97, mod 11, ...). Respond ONLY with JSON:
+{{"name": "SHORT_UPPERCASE_NAME", "description": "what this rule does", "rule_type": "builtin|detector|regex|file_size|extension|network",
+  "rule_data": {{...}}, "severity": "LOW|MEDIUM|HIGH|CRITICAL", "action": "monitor|warn|block"}}
 """
-        
+
         prompt = f"{system_instructions}\n\nUSER REQUEST: {redact_for_llm(user_prompt)}\n\nJSON RULE:"
         
         try:

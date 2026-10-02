@@ -22,6 +22,7 @@ from typing import Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.file_scanner import FileContentScanner
+from src.detection.config import DetectorConfigStore
 from src.network_monitor import BrowserHistoryScanner
 from src.database import Database
 
@@ -38,9 +39,10 @@ class WebDLPAgent:
         self.active_policies = []
 
         # Real scanners
-        self.file_scanner = FileContentScanner()
         self.browser_scanner = BrowserHistoryScanner()
         self.db = Database()
+        # Same detector library as the console (overrides + custom detectors from the local DB).
+        self.file_scanner = FileContentScanner(detector_store=DetectorConfigStore(self.db))
 
         self._running = True
         self._scanned_files = set()  # Track already-scanned files

@@ -29,6 +29,12 @@ from src.file_scanner import FileContentScanner, quick_scan
 from src.incident_store import IncidentStore
 from src.rules_engine import RulesEngine, policy_detector_name
 from src.detection import get_engine as get_detection_engine, DETECTORS
+from src.detection import config as detector_config
+from src.detection.config import DetectorConfigStore
+from src.detection.engine import DetectionEngine
+from src.detection.generators import DETECTOR_GENERATORS, GENERATORS, generate as generate_samples
+from src.detection.validators import VALIDATOR_INFO, VALIDATORS
+from src.file_scanner import configure_redaction
 from src.telegram_bot import DLPTelegramBot, scrub_token
 
 app = Flask(__name__)
@@ -59,6 +65,7 @@ fp_classifier: FalsePositiveClassifier | None = None
 telegram_bot: DLPTelegramBot | None = None
 database: Database | None = None
 file_scanner: FileContentScanner | None = None
+detector_store: DetectorConfigStore | None = None
 browser_incident_lock = threading.Lock()
 
 AUTH_SECRET = os.getenv('APP_AUTH_SECRET', '').strip()
@@ -247,6 +254,10 @@ def _required_permission_for_request(path: str, method: str) -> str | None:
         return 'exceptions.manage' if m in {'POST', 'PUT', 'PATCH', 'DELETE'} else 'exceptions.view'
     if p.startswith('/api/lab'):
         return 'ai_lab.manage' if m in {'POST', 'PUT', 'PATCH', 'DELETE'} else None
+    if p.startswith('/api/detectors'):
+        if p in {'/api/detectors/test', '/api/detectors/check', '/api/detectors/generate'}:
+            return 'policies.view'
+        return 'policies.manage' if m in {'POST', 'PUT', 'PATCH', 'DELETE'} else 'policies.view'
     if p.startswith('/api/fleet'):
         if m in {'POST', 'PUT', 'PATCH', 'DELETE'}:
             if p in {'/api/fleet/checkin'} or p.startswith('/api/fleet/agents/') and p.endswith('/operational'):
@@ -497,7 +508,8 @@ def _auth_guard():
 
     # Viewers remain read-only for authenticated console APIs (except self-service auth endpoints).
     if method in {'POST', 'PUT', 'PATCH', 'DELETE'} and g.current_role == 'VIEWER' and path not in {
-        '/api/auth/change-password', '/api/auth/profile', '/api/auth/logout', '/api/auth/sessions/revoke'
+        '/api/auth/change-password', '/api/auth/profile', '/api/auth/logout', '/api/auth/sessions/revoke',
+        '/api/detectors/test', '/api/detectors/check', '/api/detectors/generate',
     }:
         return jsonify({'error': 'forbidden_read_only_role'}), 403
 
@@ -1099,7 +1111,7 @@ def _aggregate_legacy_exceptions(exception_sets: list[dict], existing: dict | No
 def init_components(store, rules, processor, escalation, analyzer, classifier, bot, db=None):
     """Initialize components from main.py"""
     global incident_store, rules_engine, event_processor, escalation_engine
-    global ai_analyzer, fp_classifier, telegram_bot, database, file_scanner
+    global ai_analyzer, fp_classifier, telegram_bot, database, file_scanner, detector_store
     incident_store = store
     rules_engine = rules
     event_processor = processor
@@ -1108,7 +1120,11 @@ def init_components(store, rules, processor, escalation, analyzer, classifier, b
     fp_classifier = classifier
     telegram_bot = bot
     database = db or (store.db if hasattr(store, 'db') else None)
-    file_scanner = FileContentScanner()
+    detector_store = DetectorConfigStore(database)
+    if rules_engine is not None:
+        rules_engine.detector_store = detector_store
+    file_scanner = FileContentScanner(detector_store=detector_store)
+    configure_redaction(detector_store)
     _bootstrap_local_admin()
 
 
@@ -4164,16 +4180,202 @@ def sync_policies():
         managed = meta.get('managed_settings', {}) if isinstance(meta, dict) else {}
         managed_settings = _normalize_managed_extension_settings(managed)
 
-    return jsonify({"patterns": patterns, "managed_settings": managed_settings}), 200
+    return jsonify({
+        "patterns": patterns,
+        "managed_settings": managed_settings,
+        "detector_config": detector_store.snapshot() if detector_store else None,
+    }), 200
+
+
+# ============== DETECTOR LIBRARY ==============
+
+def _detector_changed():
+    if detector_store:
+        detector_store.invalidate()
+    if rules_engine:
+        rules_engine.invalidate()
+
+
+def _detector_public(d: dict) -> dict:
+    keys = ("name", "description", "category", "severity", "confidence", "pattern", "ignore_case", "group",
+            "validator", "keywords", "require_keyword", "prefilter", "generic", "enabled", "source",
+            "overridden", "defaults", "created_at", "updated_at", "updated_by")
+    out = {k: d.get(k) for k in keys if k in d}
+    out["has_generator"] = d.get("name") in DETECTOR_GENERATORS or bool(d.get("validator") in GENERATORS)
+    return out
 
 
 @app.route('/api/detectors', methods=['GET'])
 def list_detectors():
-    """Built-in detector catalogue (for policy authoring in the console)."""
-    return jsonify({"detectors": [
-        {k: d.get(k) for k in ("name", "description", "category", "severity", "validator", "keywords", "require_keyword")}
-        for d in DETECTORS
-    ]}), 200
+    """Detector library (built-in + custom) with current settings and defaults."""
+    if not detector_store:
+        return jsonify({"detectors": [_detector_public({**d, "source": "builtin", "enabled": True}) for d in DETECTORS]}), 200
+    usage = {}
+    if database:
+        for p in database.get_policies():
+            rd = p.get('rule_data') if isinstance(p.get('rule_data'), dict) else {}
+            if rd.get('detector'):
+                usage.setdefault(str(rd['detector']).upper(), []).append(p.get('name'))
+    detectors = []
+    for d in detector_store.detectors():
+        row = _detector_public(d)
+        row["used_by_policies"] = usage.get(d["name"], [])
+        detectors.append(row)
+    return jsonify({
+        "detectors": detectors,
+        "validators": [{"name": k, "description": v, "generator": k in GENERATORS} for k, v in VALIDATOR_INFO.items()],
+        "categories": list(detector_config.CATEGORIES),
+        "severities": list(detector_config.SEVERITIES),
+    }), 200
+
+
+@app.route('/api/detectors', methods=['POST'])
+def create_detector():
+    """Create a custom detector (regex + optional validator + keyword context)."""
+    if not database:
+        return jsonify({"error": "Database not configured"}), 500
+    data = request.get_json(silent=True) or {}
+    clean, errors = detector_config.validate_custom(data)
+    if errors:
+        return jsonify({"error": "; ".join(errors), "errors": errors}), 400
+    if any(c["name"] == clean["name"] for c in database.list_custom_detectors()):
+        return jsonify({"error": f"Detector {clean['name']} already exists"}), 409
+    database.upsert_custom_detector(clean, actor=_actor_from_request('admin'))
+    _detector_changed()
+    return jsonify({"status": "created", "detector": clean}), 201
+
+
+@app.route('/api/detectors/<name>', methods=['PATCH', 'PUT'])
+def update_detector(name):
+    """Edit a detector. Built-ins store an override (reset with DELETE); custom ones are updated."""
+    if not database:
+        return jsonify({"error": "Database not configured"}), 500
+    name = str(name or '').upper()
+    data = request.get_json(silent=True) or {}
+    actor = _actor_from_request('admin')
+    if name in detector_config.BUILTIN_BY_NAME:
+        current = (database.get_detector_overrides().get(name) or {}).get("settings", {})
+        merged = {**current, **{k: v for k, v in data.items() if k in detector_config.OVERRIDABLE}}
+        clean, errors = detector_config.validate_override(name, merged)
+        if errors:
+            return jsonify({"error": "; ".join(errors), "errors": errors}), 400
+        if clean:
+            database.set_detector_override(name, clean, actor=actor)
+        else:
+            database.delete_detector_override(name, actor=actor)
+        _detector_changed()
+        return jsonify({"status": "updated", "overrides": clean}), 200
+    existing = next((c for c in database.list_custom_detectors() if c["name"] == name), None)
+    if not existing:
+        return jsonify({"error": f"Unknown detector {name}"}), 404
+    merged = {**existing, **data, "name": name}
+    clean, errors = detector_config.validate_custom(merged)
+    if errors:
+        return jsonify({"error": "; ".join(errors), "errors": errors}), 400
+    database.upsert_custom_detector(clean, actor=actor)
+    _detector_changed()
+    return jsonify({"status": "updated", "detector": clean}), 200
+
+
+@app.route('/api/detectors/<name>', methods=['DELETE'])
+def delete_detector(name):
+    """Delete a custom detector, or reset a built-in detector to its defaults."""
+    if not database:
+        return jsonify({"error": "Database not configured"}), 500
+    name = str(name or '').upper()
+    actor = _actor_from_request('admin')
+    if name in detector_config.BUILTIN_BY_NAME:
+        database.delete_detector_override(name, actor=actor)
+        _detector_changed()
+        return jsonify({"status": "reset"}), 200
+    in_use = [p.get('name') for p in database.get_policies()
+              if isinstance(p.get('rule_data'), dict) and str(p['rule_data'].get('detector') or '').upper() == name]
+    if in_use:
+        return jsonify({"error": f"Detector is used by policies: {', '.join(in_use)}"}), 409
+    if not database.delete_custom_detector(name, actor=actor):
+        return jsonify({"error": f"Unknown detector {name}"}), 404
+    _detector_changed()
+    return jsonify({"status": "deleted"}), 200
+
+
+@app.route('/api/detectors/test', methods=['POST'])
+def test_detector():
+    """Lab: run sample text through one detector (saved or unsaved draft) or the whole library.
+
+    Body: {"text": "...", "detector": "NAME"} | {"text": "...", "definition": {...}} | {"text": "..."}
+    """
+    data = request.get_json(silent=True) or {}
+    text = str(data.get('text') or '')
+    if not text.strip():
+        return jsonify({"error": "text is required"}), 400
+    if len(text) > 1_000_000:
+        return jsonify({"error": "text is limited to 1,000,000 characters"}), 400
+    definition = data.get('definition')
+    name = str(data.get('detector') or '').upper()
+    if isinstance(definition, dict):
+        # Drafts are validated like custom detectors; the name is irrelevant for a test run.
+        clean, errors = detector_config.validate_custom({**definition, "name": "DRAFT_TEST"})
+        if errors:
+            return jsonify({"error": "; ".join(errors), "errors": errors}), 400
+        candidates = DetectionEngine.trace(text, clean)
+        return jsonify({"mode": "definition", "candidates": candidates,
+                        "accepted": sum(1 for c in candidates if c["accepted"])}), 200
+    if name:
+        d = next((x for x in (detector_store.detectors() if detector_store else DETECTORS) if x["name"] == name), None)
+        if not d:
+            return jsonify({"error": f"Unknown detector {name}"}), 404
+        engine_def = {k: v for k, v in d.items() if k not in ("source", "overridden", "defaults", "enabled")}
+        candidates = DetectionEngine.trace(text, engine_def)
+        return jsonify({"mode": "detector", "detector": name, "enabled": d.get("enabled", True),
+                        "candidates": candidates, "accepted": sum(1 for c in candidates if c["accepted"])}), 200
+    engine = detector_store.engine() if detector_store else get_detection_engine()
+    outcome = engine.scan(text)
+    findings = [{"detector": m.detector, "value": m.value, "start": m.start, "end": m.end, "severity": m.severity,
+                 "confidence": m.confidence, "category": m.category, "validated": m.validated,
+                 "keyword": m.keyword, "encoding": m.encoding, "line": m.line} for m in outcome.matches]
+    return jsonify({"mode": "library", "findings": findings, "counts": outcome.counts}), 200
+
+
+@app.route('/api/detectors/check', methods=['POST'])
+def check_value():
+    """Lab: which checksum validators does a value pass? Body: {"value": "...", "validator": optional}."""
+    data = request.get_json(silent=True) or {}
+    value = str(data.get('value') or '').strip()
+    if not value or len(value) > 200:
+        return jsonify({"error": "value is required (max 200 characters)"}), 400
+    names = [data['validator']] if data.get('validator') in VALIDATORS else [
+        k for k in VALIDATOR_INFO if k not in {'not_placeholder', 'high_entropy_secret', 'url_credentials', 'jwt'}]
+    results = []
+    for k in names:
+        try:
+            ok = bool(VALIDATORS[k](value))
+        except Exception:
+            ok = False
+        results.append({"validator": k, "valid": ok, "description": VALIDATOR_INFO.get(k, "")})
+    return jsonify({"value": value, "results": results, "passed": [r["validator"] for r in results if r["valid"]]}), 200
+
+
+@app.route('/api/detectors/generate', methods=['POST'])
+def generate_test_values():
+    """Lab: synthetic values with valid check digits for testing policies (never real data)."""
+    data = request.get_json(silent=True) or {}
+    kind = str(data.get('kind') or '').strip()
+    options = data.get('options') if isinstance(data.get('options'), dict) else {}
+    allowed = {"brand", "country", "length", "prefix", "formatted"}
+    options = {k: v for k, v in options.items() if k in allowed}
+    if 'length' in options:
+        try:
+            options['length'] = max(4, min(int(options['length']), 30))
+        except (TypeError, ValueError):
+            options.pop('length')
+    try:
+        values = generate_samples(kind, int(data.get('count') or 5), **options)
+    except KeyError:
+        return jsonify({"error": f"No generator for {kind}",
+                        "kinds": sorted(set(GENERATORS) | set(DETECTOR_GENERATORS))}), 400
+    except TypeError as e:
+        return jsonify({"error": f"Invalid options for {kind}: {e}"}), 400
+    return jsonify({"kind": kind, "values": values}), 200
 
 
 @app.route('/api/exceptions', methods=['GET'])
@@ -4253,6 +4455,43 @@ def delete_exception(exception_id):
 
 # ============== AI POLICY LAB ==============
 
+def _structured_lab_rule(ai_rule: dict, prompt: str) -> dict | None:
+    """Builtin-reference or custom-detector rule from LLM output, else from the offline builder."""
+    from src.detection.rule_builder import suggest_from_prompt
+
+    def normalize(rule: dict, source: str) -> dict | None:
+        kind = str(rule.get('rule_type') or '').lower()
+        severity = str(rule.get('severity') or 'MEDIUM').upper()
+        severity = severity if severity in {'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'} else 'MEDIUM'
+        action = str(rule.get('action') or 'monitor').lower()
+        action = action if action in {'monitor', 'warn', 'block'} else 'monitor'
+        name = re.sub(r'[^A-Z0-9_]+', '_', str(rule.get('name') or 'CUSTOM_RULE').upper()).strip('_')[:40] or 'CUSTOM_RULE'
+        base = {'name': name, 'description': str(rule.get('description') or prompt)[:300], 'severity': severity,
+                'action': action, 'ai_generated': source == 'ai', 'source': source, 'ai_prompt': prompt, 'ai_model': 'Gemini'}
+        rd = rule.get('rule_data') if isinstance(rule.get('rule_data'), dict) else {}
+        if kind == 'builtin':
+            det = policy_detector_name({'detector': rd.get('detector')}, detector_store)
+            if not det:
+                return None
+            return {**base, 'kind': 'builtin', 'rule_type': 'regex', 'rule_data': {'detector': det}, 'pattern': det}
+        if kind == 'detector':
+            definition = rule.get('detector_definition') if isinstance(rule.get('detector_definition'), dict) else {
+                **rd, 'name': name, 'severity': severity.lower(), 'description': base['description']}
+            clean, errors = detector_config.validate_custom(definition)
+            if errors:
+                return None
+            return {**base, 'name': clean['name'], 'kind': 'detector', 'rule_type': 'regex',
+                    'rule_data': {'detector': clean['name']}, 'detector_definition': clean, 'pattern': clean['pattern']}
+        return None
+
+    if 'error' not in ai_rule:
+        out = normalize(ai_rule, 'ai')
+        if out:
+            return out
+    offline = suggest_from_prompt(prompt)
+    return normalize(offline, 'offline') if offline else None
+
+
 @app.route('/api/lab/generate_rule', methods=['POST'])
 def generate_rule():
     """Generate a policy rule from natural language using AI"""
@@ -4272,9 +4511,15 @@ def generate_rule():
         if not isinstance(ai_rule, dict):
             ai_rule = {}
 
+        # Validated detector rules (built-in reference or new detector with checksum) take priority:
+        # first from the LLM, otherwise from the offline rule builder.
+        structured = _structured_lab_rule(ai_rule, prompt)
+        if structured:
+            return jsonify(structured), 200
+
         # Fallback/local normalization for noisy client prompts (typos, vague wording)
         prompt_l = prompt.lower()
-        inferred_type = ai_rule.get('rule_type') or 'regex'
+        inferred_type = ai_rule.get('rule_type') if 'error' not in ai_rule else None
         if inferred_type not in {'regex', 'file_size', 'extension', 'network'}:
             if any(k in prompt_l for k in ['.exe', '.dll', '.pdf', '.doc', 'extension', 'file type', 'filetype']):
                 inferred_type = 'extension'
@@ -4353,14 +4598,16 @@ def generate_rule():
         return jsonify({
             'name': name,
             'description': description,
+            'kind': inferred_type,
             'rule_type': inferred_type,
             'rule_data': rule_data,
             'pattern': preview,
             'action': action,
             'severity': severity,
-            'ai_generated': True,
+            'ai_generated': 'error' not in ai_rule,
+            'source': 'ai' if 'error' not in ai_rule else 'offline',
             'ai_prompt': prompt,
-            'ai_model': 'VertexAI',
+            'ai_model': 'Gemini',
         }), 200
 
     except Exception as e:
@@ -4469,9 +4716,10 @@ def create_policy():
     if rule_type == 'regex':
         detector = str(data.get('detector') or rule_data.get('detector') or '').strip().upper()
         if detector:
-            if not policy_detector_name({'detector': detector}):
-                return jsonify({"error": f"Unknown detector: {detector}", "detectors": get_detection_engine().detector_names}), 400
-            rule_data['detector'] = policy_detector_name({'detector': detector})
+            resolved = policy_detector_name({'detector': detector}, detector_store)
+            if not resolved:
+                return jsonify({"error": f"Unknown detector: {detector}"}), 400
+            rule_data['detector'] = resolved
         if not rule_data.get('pattern'):
             rule_data['pattern'] = regex_pattern
         if not rule_data.get('pattern') and not rule_data.get('detector'):
