@@ -492,7 +492,7 @@ const Dashboard = ({ stats, incidents, onSelectIncident, apiBase, onIncidentsCha
                                     <td style={{ padding: '12px 16px', borderBottom: '1px solid var(--table-row-border)', textAlign: 'center' }}>
                                         <span style={{ 
                                             padding: '4px 10px', borderRadius: '4px', fontSize: '10px', fontWeight: 700,
-                                            background: inc.risk > 80 ? 'rgba(248, 81, 73, 0.15)' : 'rgba(88, 166, 255, 0.15)',
+                                            background: inc.risk > 80 ? 'rgba(248, 81, 73, 0.15)' : 'var(--chip-accent-bg)',
                                             color: inc.risk > 80 ? 'var(--danger)' : 'var(--accent)',
                                             display: 'inline-block'
                                         }}>{inc.risk} / 100</span>

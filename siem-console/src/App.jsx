@@ -13,6 +13,7 @@ import Login from './pages/Login';
 import Profile from './pages/Profile';
 import Governance from './pages/Governance';
 import Detectors from './pages/Detectors';
+import TronLogo from './components/TronLogo';
 import Icon from './components/Icons';
 import { runSoon } from './utils';
 
@@ -27,10 +28,10 @@ const LIGHT_THEME_VARS = {
   '--text-soft': '#0f172a',
   '--text-muted': '#2d3748',
   '--text-inverse': '#ffffff',
-  '--accent': '#4f46e5',
-  '--accent-hover': '#4338ca',
+  '--accent': '#111111',
+  '--accent-hover': '#000000',
   '--border-color': '#e4e7ee',
-  '--chip-accent-bg': '#eef0ff',
+  '--chip-accent-bg': '#f1f1f3',
   '--surface-subtle': '#f7f7f9',
   '--surface-muted': '#f6f6f8',
   '--table-bg': '#ffffff',
@@ -776,7 +777,7 @@ function App() {
       {/* Sidebar Navigation */}
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-mark"><Icon name="shield" size={18} /></div>
+          <div className="brand-mark"><TronLogo size={22} /></div>
           <div>
             <div className="brand-name">Tron DLP</div>
             <div className="brand-sub">Data Loss Prevention</div>

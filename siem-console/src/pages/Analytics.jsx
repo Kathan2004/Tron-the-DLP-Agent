@@ -11,6 +11,14 @@ ChartJS.register(
     BarElement, ArcElement, Title, Tooltip, Legend, Filler
 );
 
+// #rrggbb + alpha -> rgba(); follows the theme accent (black in light, blue in dark).
+const withAlpha = (hex, a) => {
+    const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || '').trim());
+    if (!m) return hex;
+    const n = parseInt(m[1], 16);
+    return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${a})`;
+};
+
 // Shared chart defaults
 const chartFont = { family: "'Inter', sans-serif" };
 
@@ -164,7 +172,7 @@ const Analytics = ({ apiBase }) => {
             label: 'Events',
             data: (data?.events_hourly || []).map(d => d.count),
             borderColor: cssVars.accent,
-            backgroundColor: 'rgba(88,166,255,0.10)',
+            backgroundColor: withAlpha(cssVars.accent, 0.10),
             fill: true,
             tension: 0.3,
             pointRadius: 2,
@@ -235,7 +243,7 @@ const Analytics = ({ apiBase }) => {
             datasets: [{
                 label: 'Closed Incidents',
                 data: rows.map(r => Number(r.closed_count || 0)),
-                backgroundColor: 'rgba(88,166,255,0.6)',
+                backgroundColor: withAlpha(cssVars.accent, 0.6),
                 borderColor: cssVars.accent,
                 borderWidth: 1,
             }]

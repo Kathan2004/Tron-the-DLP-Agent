@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import Icon from '../components/Icons';
+import TronLogo from '../components/TronLogo';
 
 const Login = ({ apiBase, onLogin }) => {
     const [email, setEmail] = useState('admin@tron.local');
@@ -35,7 +35,7 @@ const Login = ({ apiBase, onLogin }) => {
         <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', background: 'var(--main-content-bg)', padding: '20px' }}>
             <div style={{ width: '100%', maxWidth: '420px', background: 'var(--panel-bg)', border: '1px solid var(--border-color)', borderRadius: '12px', padding: '24px', boxShadow: 'var(--card-shadow)' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '16px' }}>
-                    <div className="brand-mark"><Icon name="shield" size={18} /></div>
+                    <div className="brand-mark"><TronLogo size={22} /></div>
                     <div>
                         <div className="brand-name">Tron DLP</div>
                         <div className="brand-sub">Security console</div>
