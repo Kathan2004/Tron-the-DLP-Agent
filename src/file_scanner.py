@@ -152,27 +152,59 @@ class FileContentScanner:
     """Scans text and files for sensitive data."""
 
     def __init__(self, engine: Optional[DetectionEngine] = None, ocr: bool = True,
-                 edm: Optional[List[EDMIndex]] = None):
-        # Default: shared engine with the built-in library. A private engine is created
-        # on demand when SIEM policies are attached (set_policies).
-        self.engine = engine or get_engine()
+                 edm: Optional[List[EDMIndex]] = None, detector_store=None):
+        """
+        engine          fixed engine (tests); default is the built-in library
+        detector_store  DetectorConfigStore: console overrides + custom detectors (API, agents)
+        """
+        self._fixed_engine = engine
+        self.detector_store = detector_store
         self.ocr = ocr
         self.edm = edm if edm is not None else edm_indexes()
+        self._policy_rules: List[dict] = []
         self._policy_version = None
+        self._engine_key = None
+        self._engine_cached: Optional[DetectionEngine] = None
+        self._engine_lock = threading.Lock()
         self._cache: "OrderedDict[Tuple[str, object], ScanResult]" = OrderedDict()
         self._cache_lock = threading.Lock()
+
+    # ------------------------------------------------------------------ engine resolution
+    @property
+    def engine(self) -> DetectionEngine:
+        store_version = self.detector_store.refresh() if self.detector_store is not None else None
+        key = (store_version, self._policy_version)
+        if self._engine_cached is not None and key == self._engine_key:
+            return self._engine_cached
+        with self._engine_lock:
+            if self._engine_cached is None or key != self._engine_key:
+                if self._fixed_engine is not None:
+                    eng = self._fixed_engine
+                    if self._policy_rules:
+                        eng = DetectionEngine(eng.definitions)
+                elif self.detector_store is not None:
+                    eng = self.detector_store.engine()
+                    if self._policy_rules:
+                        eng = DetectionEngine(self.detector_store.effective_detectors())
+                else:
+                    eng = DetectionEngine() if self._policy_rules else get_engine()
+                if self._policy_rules:
+                    eng.set_custom_rules(self._policy_rules)
+                self._engine_cached, self._engine_key = eng, key
+        return self._engine_cached
+
+    @property
+    def cache_key(self):
+        _ = self.engine
+        return self._engine_key
 
     # ------------------------------------------------------------------ policies
     def set_policies(self, regex_rules: List[dict], version=None) -> None:
         """Attach console regex policies (name, pattern, severity, ...). Cheap if unchanged."""
         if version is not None and version == self._policy_version:
             return
-        if self.engine is get_engine():
-            self.engine = DetectionEngine()
-        self.engine.set_custom_rules(regex_rules)
+        self._policy_rules = list(regex_rules or [])
         self._policy_version = version if version is not None else object()
-        with self._cache_lock:
-            self._cache.clear()
 
     # ------------------------------------------------------------------ text
     def scan_text(self, text: str, source: str = "unknown") -> List[ScanFinding]:
@@ -201,7 +233,7 @@ class FileContentScanner:
         """Scan in-memory content. Returns (result, extraction); extraction is None on cache hit."""
         started = datetime.now()
         file_hash = hashlib.sha256(data).hexdigest()
-        key = (file_hash, self._policy_version)
+        key = (file_hash, self.cache_key)
         with self._cache_lock:
             cached = self._cache.get(key)
             if cached is not None:
@@ -312,15 +344,34 @@ class FileContentScanner:
         return text
 
 
+_redaction_store = None
+_redaction_engine: Optional[DetectionEngine] = None
+_redaction_version = None
+
+
+def configure_redaction(detector_store) -> None:
+    """Include console custom detectors in LLM redaction (built-ins are always included)."""
+    global _redaction_store
+    _redaction_store = detector_store
+
+
 def redact_for_llm(text: str) -> str:
     """Mask every sensitive value before text is sent to an external LLM.
 
-    Uses the full detector library with keyword requirements ignored (over-redaction is the
-    safe failure mode), e.g. "ssn 536-22-1234" -> "ssn [REDACTED:US_SSN]".
+    Uses every built-in detector (even ones disabled for alerting) plus custom detectors, with
+    keyword requirements ignored: over-redaction is the safe failure mode.
+    e.g. "ssn 536-22-1234" -> "ssn [REDACTED:US_SSN]".
     """
+    global _redaction_engine, _redaction_version
     if not text:
         return text
-    return get_engine().redact(str(text))
+    if _redaction_store is None:
+        return get_engine().redact(str(text))
+    version = _redaction_store.refresh()
+    if _redaction_engine is None or version != _redaction_version:
+        _redaction_engine = DetectionEngine(_redaction_store.redaction_detectors())
+        _redaction_version = version
+    return _redaction_engine.redact(str(text))
 
 
 def quick_scan(path: str) -> List[Dict]:

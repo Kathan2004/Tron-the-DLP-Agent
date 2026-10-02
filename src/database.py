@@ -499,6 +499,23 @@ class Database:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_custom_roles_active ON custom_roles(is_active)")
             # ---------------------------------------------------------
 
+            # Detector library configuration (console-editable)
+            cur.executescript("""
+                CREATE TABLE IF NOT EXISTS detector_overrides (
+                    name TEXT PRIMARY KEY,
+                    settings TEXT NOT NULL,
+                    updated_at TEXT DEFAULT (datetime('now')),
+                    updated_by TEXT
+                );
+                CREATE TABLE IF NOT EXISTS custom_detectors (
+                    name TEXT PRIMARY KEY,
+                    definition TEXT NOT NULL,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    updated_at TEXT DEFAULT (datetime('now')),
+                    updated_by TEXT
+                );
+            """)
+
             # Seed security team if empty
             cur.execute("SELECT COUNT(*) FROM security_team")
             if cur.fetchone()[0] == 0:
@@ -537,6 +554,73 @@ class Database:
                     if row and _json_equal(row[0], legacy):
                         cur.execute("UPDATE policies SET rule_data = ? WHERE policy_id = ?",
                                     (json.dumps(DEFAULT_POLICY_RULE_DATA[policy_id]), policy_id))
+
+    # ==================== DETECTOR LIBRARY ====================
+
+    def get_detector_overrides(self) -> Dict[str, Dict]:
+        with self._cursor() as cur:
+            cur.execute("SELECT name, settings, updated_at, updated_by FROM detector_overrides")
+            out = {}
+            for row in cur.fetchall():
+                try:
+                    settings = json.loads(row["settings"] or "{}")
+                except Exception:
+                    settings = {}
+                out[row["name"]] = {"settings": settings, "updated_at": row["updated_at"], "updated_by": row["updated_by"]}
+            return out
+
+    def set_detector_override(self, name: str, settings: Dict, actor: Optional[str] = None) -> None:
+        with self._cursor() as cur:
+            cur.execute("""
+                INSERT INTO detector_overrides (name, settings, updated_at, updated_by)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET settings = excluded.settings,
+                    updated_at = excluded.updated_at, updated_by = excluded.updated_by
+            """, (name, json.dumps(settings), datetime.now().isoformat(), actor))
+        self._log_audit("detector_override_set", "detector", name, actor or "system", json.dumps(settings))
+
+    def delete_detector_override(self, name: str, actor: Optional[str] = None) -> bool:
+        with self._cursor() as cur:
+            cur.execute("DELETE FROM detector_overrides WHERE name = ?", (name,))
+            deleted = cur.rowcount > 0
+        if deleted:
+            self._log_audit("detector_override_reset", "detector", name, actor or "system")
+        return deleted
+
+    def list_custom_detectors(self) -> List[Dict]:
+        with self._cursor() as cur:
+            cur.execute("SELECT name, definition, created_at, updated_at, updated_by FROM custom_detectors ORDER BY name")
+            out = []
+            for row in cur.fetchall():
+                try:
+                    d = json.loads(row["definition"] or "{}")
+                except Exception:
+                    continue
+                d.update({"name": row["name"], "created_at": row["created_at"],
+                          "updated_at": row["updated_at"], "updated_by": row["updated_by"]})
+                out.append(d)
+            return out
+
+    def upsert_custom_detector(self, definition: Dict, actor: Optional[str] = None) -> None:
+        name = definition["name"]
+        body = {k: v for k, v in definition.items() if k not in {"name", "created_at", "updated_at", "updated_by"}}
+        now = datetime.now().isoformat()
+        with self._cursor() as cur:
+            cur.execute("""
+                INSERT INTO custom_detectors (name, definition, created_at, updated_at, updated_by)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET definition = excluded.definition,
+                    updated_at = excluded.updated_at, updated_by = excluded.updated_by
+            """, (name, json.dumps(body), now, now, actor))
+        self._log_audit("custom_detector_saved", "detector", name, actor or "system")
+
+    def delete_custom_detector(self, name: str, actor: Optional[str] = None) -> bool:
+        with self._cursor() as cur:
+            cur.execute("DELETE FROM custom_detectors WHERE name = ?", (name,))
+            deleted = cur.rowcount > 0
+        if deleted:
+            self._log_audit("custom_detector_deleted", "detector", name, actor or "system")
+        return deleted
 
     # ==================== EVENT OPERATIONS ====================
 

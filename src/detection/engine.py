@@ -132,7 +132,8 @@ class DetectionEngine:
     """Compiled detector set. Thread-safe for concurrent scans (no mutable scan state)."""
 
     def __init__(self, detectors: Iterable[dict] = DETECTORS, custom_rules: Iterable[dict] = ()):
-        self._builtin = [_compile_detector(d) for d in detectors]
+        self.definitions = list(detectors)
+        self._builtin = [_compile_detector(d) for d in self.definitions]
         self._by_name = {c.name: c for c in self._builtin}
         self._custom: List[_Compiled] = []
         self.set_custom_rules(custom_rules)
@@ -277,6 +278,45 @@ class DetectionEngine:
                 out.append(c)
         return out
 
+    # ---------------------------------------------------------------- explainability
+    @staticmethod
+    def trace(text: str, definition: dict, limit: int = 200) -> List[dict]:
+        """Every regex candidate for one detector definition, with the decision and reason.
+
+        Used by the console Lab to show *why* something did or did not fire.
+        """
+        det = _compile_detector(definition, source="trace")
+        norm = normalize_text(text or "")
+        lower = norm.lower()
+        has_kw_anywhere = bool(det.keyword_re and _find_keyword(det.keyword_re, lower, 0, len(lower)))
+        out = []
+        for m in det.regex.finditer(norm):
+            try:
+                value, (start, end) = m.group(det.group), m.span(det.group)
+            except IndexError:
+                value, (start, end) = m.group(0), m.span(0)
+            if value is None:
+                continue
+            row = {"value": value, "start": start, "end": end, "validator": definition.get("validator"),
+                   "validator_passed": None, "keyword": None, "accepted": True, "reason": "matched",
+                   "confidence": det.confidence}
+            if det.validator is not None:
+                row["validator_passed"] = bool(det.validator(value))
+                if not row["validator_passed"]:
+                    row.update(accepted=False, reason=f"failed {definition.get('validator')} check")
+            if det.keyword_re is not None:
+                row["keyword"] = _find_keyword(det.keyword_re, lower, max(0, m.start() - KEYWORD_WINDOW), m.end() + KEYWORD_WINDOW)
+                if row["keyword"]:
+                    row["confidence"] = round(min(det.confidence + KEYWORD_BOOST, 0.99), 2)
+            if row["accepted"] and det.require_keyword and not row["keyword"]:
+                row.update(accepted=False, reason="no keyword within %d characters" % KEYWORD_WINDOW)
+            if row["accepted"]:
+                row["reason"] = "validated" if row["validator_passed"] else ("matched with keyword" if row["keyword"] else "matched")
+            out.append(row)
+            if len(out) >= limit:
+                break
+        return out
+
     # ---------------------------------------------------------------- redaction
     def redact(self, text: str) -> str:
         """Replace every sensitive value with [REDACTED:<DETECTOR>].
@@ -310,7 +350,8 @@ def _find_keyword(keyword_re, lower: str, lo: int, hi: int) -> Optional[str]:
 
 
 def _priority(m: Match):
-    return (not m.generic, m.validated, SEVERITY_RANK.get(m.severity, 0), m.confidence, m.end - m.start)
+    # Longer validated spans are more specific (an IBAN that contains card-like digits).
+    return (not m.generic, m.validated, m.end - m.start, SEVERITY_RANK.get(m.severity, 0), m.confidence)
 
 
 def _resolve_overlaps(candidates: List[Match]) -> List[Match]:

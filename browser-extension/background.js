@@ -120,12 +120,15 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 
 // Load settings on startup
-chrome.storage.local.get(["settings", "scanHistory", "stats", "dynamicPatterns", "pendingArtifactQueue", POLICY_HIT_TRACKER_STORAGE_KEY], (data) => {
+chrome.storage.local.get(["settings", "scanHistory", "stats", "dynamicPatterns", "detectorConfig", "pendingArtifactQueue", POLICY_HIT_TRACKER_STORAGE_KEY], (data) => {
     if (data.settings) settings = { ...DEFAULT_SETTINGS, ...data.settings };
     if (data.scanHistory) scanHistory = data.scanHistory || [];
     if (data.stats) stats = { ...stats, ...data.stats };
     if (Array.isArray(data.pendingArtifactQueue)) pendingArtifactQueue = data.pendingArtifactQueue;
     hydratePolicyHitTracker(data[POLICY_HIT_TRACKER_STORAGE_KEY]);
+    if (data.detectorConfig && globalThis.TronScanner) {
+        globalThis.TronScanner.applyDetectorConfig(data.detectorConfig);
+    }
     if (data.dynamicPatterns && globalThis.TronScanner) {
         globalThis.TronScanner.updatePatterns(data.dynamicPatterns);
     }
@@ -396,6 +399,11 @@ async function syncPolicies() {
         if (response.ok) {
             const data = await response.json();
             const patterns = Array.isArray(data.patterns) ? data.patterns : [];
+            if (data.detector_config && globalThis.TronScanner) {
+                // Console detector library edits (overrides, custom detectors).
+                globalThis.TronScanner.applyDetectorConfig(data.detector_config);
+                chrome.storage.local.set({ detectorConfig: data.detector_config });
+            }
 
             const networkPolicyDomains = patterns
                 .filter(p => {

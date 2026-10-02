@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.network_monitor import NetworkMonitor, ProcessMonitor, BrowserHistoryScanner
 from src.file_scanner import FileContentScanner
+from src.detection.config import DetectorConfigStore
 from src.database import Database
 
 
@@ -39,8 +40,9 @@ class NetworkDLPAgent:
         self.network_monitor = NetworkMonitor()
         self.process_monitor = ProcessMonitor()
         self.browser_scanner = BrowserHistoryScanner()
-        self.file_scanner = FileContentScanner()
         self.db = Database()
+        # Same detector library as the console (overrides + custom detectors from the local DB).
+        self.file_scanner = FileContentScanner(detector_store=DetectorConfigStore(self.db))
 
         self._running = True
         self._stats = {

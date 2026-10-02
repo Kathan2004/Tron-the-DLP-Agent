@@ -12,6 +12,8 @@ vm.createContext(ctx);
 for (const f of ["detectors.js", "scanner.js"]) {
     vm.runInContext(fs.readFileSync(path.join(ext, f), "utf8"), ctx, { filename: f });
 }
+const config = process.argv[3] ? JSON.parse(process.argv[3]) : null;
+if (config) ctx.TronScanner.applyDetectorConfig(config);
 const policies = process.argv[2] ? JSON.parse(process.argv[2]) : null;
 if (policies) ctx.TronScanner.updatePatterns(policies);
 
