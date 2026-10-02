@@ -15,6 +15,7 @@ const applyBootThemeVars = (theme) => {
       '--bg-color': '#ffffff', '--panel-bg': '#ffffff', '--panel-bg-alt': '#f7f8fb',
       '--text-main': '#1f2937', '--text-strong': '#111827', '--text-muted': '#2d3748',
       '--border-color': '#e4e7ee', '--table-bg': '#ffffff', '--table-head-bg': '#f4f6fa',
+      '--accent': '#111111', '--accent-hover': '#000000', '--chip-accent-bg': '#f1f1f3',
       '--main-content-bg': '#ffffff',
     };
   const rootStyle = document.documentElement?.style;
