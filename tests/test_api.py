@@ -98,3 +98,43 @@ def test_request_size_cap(client):
     big = b"x" * (api.app.config["MAX_CONTENT_LENGTH"] + 1)
     r = client.post("/api/scan/text", data=big, content_type="application/json")
     assert r.status_code == 413
+
+
+def test_agent_token_enforced_on_ingestion_when_configured(client, monkeypatch):
+    from src import api
+    monkeypatch.setattr(api, "AGENT_TOKEN", "enroll-123")
+    event = {"agent_type": "endpoint", "source_host": "h", "user": "u", "channel": "clipboard", "payload": "x"}
+    assert post(client, "/api/events", event).status_code == 401
+    assert post(client, "/api/fleet/checkin", {"agent_id": "a"}).status_code == 401
+    r = client.post("/api/events", data=json.dumps(event), content_type="application/json",
+                    headers={"X-Tron-Agent-Token": "enroll-123"})
+    assert r.status_code == 200
+    # Health and login stay reachable without the enrollment token.
+    assert client.get("/api/health").status_code == 200
+
+
+def test_upgrade_rejects_shell_commands(client):
+    token = login(client)
+    r = post(client, "/api/fleet/agents/a1/upgrade", {"install_command": "curl x | sh"}, token)
+    assert r.status_code == 400
+    r = post(client, "/api/fleet/agents/a1/upgrade", {"download_url": "http://x/i.sh"}, token)
+    assert r.status_code == 400
+
+
+def test_upgrade_queues_signed_manifest(client):
+    import hashlib
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    token = login(client)
+    payload = b"#!/bin/sh\necho ok\n"
+    body = {
+        "download_url": "https://updates.example.com/install.sh",
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "signature": base64.b64encode(Ed25519PrivateKey.generate().sign(payload)).decode(),
+        "target_version": "1.2",
+    }
+    r = post(client, "/api/fleet/agents/a1/upgrade", body, token)
+    assert r.status_code == 200
+    assert "install_command" not in r.json["command"]
+    assert r.json["command"]["requested_by"] == "admin@tron.local"

@@ -13,13 +13,13 @@ import re
 import time
 import signal
 import hashlib
-import subprocess
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from src.agent_updates import UpgradeRejected, agent_headers, apply_upgrade
 from src.network_monitor import NetworkMonitor, ProcessMonitor, BrowserHistoryScanner
 from src.file_scanner import FileContentScanner
 from src.detection.config import DetectorConfigStore
@@ -53,20 +53,16 @@ class NetworkDLPAgent:
         }
         self.agent_version = "1.1"
 
-    def _handle_server_command(self, command):
-        if not isinstance(command, dict):
+    def _handle_server_command(self, command: Optional[dict]):
+        """Handle server-issued control commands. Only signed upgrades are accepted."""
+        if not isinstance(command, dict) or command.get('type') != 'upgrade':
             return
-        if command.get('type') != 'upgrade':
-            return
-        install_command = (command.get('install_command') or '').strip()
-        download_url = (command.get('download_url') or '').strip()
         try:
-            if install_command:
-                subprocess.Popen(install_command, shell=True)
-            elif download_url:
-                subprocess.Popen(f"curl -fsSL '{download_url}' | bash", shell=True)
+            print(f"  Upgrade command received: {apply_upgrade(command)}")
+        except UpgradeRejected as e:
+            print(f"  Upgrade rejected: {e}")
         except Exception as e:
-            print(f"  ⚠️ Upgrade command failed: {e}")
+            print(f"  Upgrade failed: {e}")
 
     def send_event(self, user: str, host: str, channel: str, payload: str, metadata: Optional[dict] = None) -> bool:
         """Send network detection to DLP API."""
@@ -83,7 +79,8 @@ class NetworkDLPAgent:
             response = requests.post(
                 f"{self.api_url}/api/events",
                 json=event_data,
-                timeout=5
+                timeout=5,
+                headers=agent_headers(),
             )
 
             if response.status_code == 200:
@@ -117,7 +114,7 @@ class NetworkDLPAgent:
                     "python_version": sys.version.split()[0]
                 }
             }
-            res = requests.post(f"{self.api_url}/api/fleet/checkin", json=payload, timeout=5)
+            res = requests.post(f"{self.api_url}/api/fleet/checkin", json=payload, timeout=5, headers=agent_headers())
             if res.ok:
                 body = res.json() if res.content else {}
                 self._handle_server_command(body.get('command'))

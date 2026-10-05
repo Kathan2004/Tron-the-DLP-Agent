@@ -50,5 +50,8 @@
                 "<all_urls>"
             ]
         }
-    ]
+    ],
+    "storage": {
+        "managed_schema": "managed_schema.json"
+    }
 }

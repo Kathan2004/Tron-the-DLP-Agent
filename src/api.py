@@ -22,6 +22,7 @@ from config.settings import Config
 from flask import Flask, jsonify, request, send_file, g
 from flask_cors import CORS
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+from src.agent_updates import UpgradeRejected, validate_upgrade_request
 from src.ai_analyzer import FalsePositiveClassifier, VertexAIAnalyzer
 from src.database import Database
 from src.event_processor import EventProcessor, EscalationEngine
@@ -419,6 +420,23 @@ def _is_public_api_request(path: str, method: str) -> bool:
     return False
 
 
+# Endpoints that never require the agent enrollment token.
+_UNAUTHENTICATED_PATHS = {'/api/health', '/api/auth/login', '/api/stream'}
+# Shared enrollment secret for agents and the browser extension. When set, every
+# agent-facing ingestion endpoint requires it in the X-Tron-Agent-Token header.
+AGENT_TOKEN = os.getenv('TRON_AGENT_TOKEN', '').strip()
+if not AGENT_TOKEN:
+    print("WARNING: TRON_AGENT_TOKEN is not set. Agent ingestion endpoints accept unauthenticated "
+          "events and check-ins from anyone who can reach the API.")
+
+
+def _agent_token_ok() -> bool:
+    if not AGENT_TOKEN:
+        return True
+    supplied = request.headers.get('X-Tron-Agent-Token', '')
+    return bool(supplied) and hmac.compare_digest(supplied, AGENT_TOKEN)
+
+
 def _role_allowed(role: str, allowed_roles: set[str]) -> bool:
     return str(role or '').upper() in {r.upper() for r in allowed_roles}
 
@@ -435,7 +453,9 @@ def _auth_guard():
     if not path.startswith('/api/'):
         return None
     if _is_public_api_request(path, method):
-        return None
+        if path in _UNAUTHENTICATED_PATHS or _agent_token_ok():
+            return None
+        return jsonify({'error': 'agent_token_required'}), 401
 
     auth = request.headers.get('Authorization', '')
     if not auth.startswith('Bearer '):
@@ -3525,22 +3545,26 @@ def fleet_agent_policy_set(agent_id):
 
 @app.route('/api/fleet/agents/<agent_id>/upgrade', methods=['POST'])
 def fleet_agent_upgrade(agent_id):
-    """Queue an upgrade command for an agent; delivered on next check-in."""
-    data = request.json or {}
-    download_url = str(data.get('download_url') or '').strip()
-    install_command = str(data.get('install_command') or '').strip()
-    target_version = str(data.get('target_version') or '').strip() or 'latest'
-    actor = str(data.get('actor') or 'secops_analyst').strip()
+    """Queue a signed upgrade for an agent; delivered on next check-in.
 
-    if not download_url and not install_command:
-        return jsonify({"error": "Provide either download_url or install_command"}), 400
+    Body: download_url (https), sha256, signature (base64 Ed25519 over the installer),
+    target_version. Agents verify the signature against their pinned TRON_UPDATE_PUBKEY
+    before executing anything; arbitrary install commands are not accepted.
+    """
+    data = request.json or {}
+    try:
+        upgrade = validate_upgrade_request(data)
+    except UpgradeRejected as e:
+        return jsonify({"error": str(e)}), 400
+    actor = str((getattr(g, 'current_user', None) or {}).get('email') or 'secops_analyst').strip()
 
     command = {
         "command_id": f"CMD-{uuid.uuid4().hex[:10].upper()}",
         "type": "upgrade",
-        "download_url": download_url or None,
-        "install_command": install_command or None,
-        "target_version": target_version,
+        "download_url": upgrade.download_url,
+        "sha256": upgrade.sha256,
+        "signature": base64.b64encode(upgrade.signature).decode('ascii'),
+        "target_version": upgrade.target_version,
         "requested_by": actor,
         "created_at": datetime.now().isoformat(),
     }
@@ -3555,12 +3579,12 @@ def fleet_agent_upgrade(agent_id):
             database.add_operational_log(
                 agent_id,
                 'upgrade_queued',
-                f"Upgrade queued by {actor} for target version {target_version}",
+                f"Upgrade queued by {actor} for target version {upgrade.target_version}",
                 {
                     "command_id": command["command_id"],
-                    "download_url": bool(download_url),
-                    "install_command": bool(install_command),
-                    "target_version": target_version,
+                    "download_url": upgrade.download_url,
+                    "sha256": upgrade.sha256,
+                    "target_version": upgrade.target_version,
                 }
             )
         except Exception:

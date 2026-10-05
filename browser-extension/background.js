@@ -8,10 +8,16 @@ importScripts("detectors.js");
 importScripts("scanner.js");
 importScripts("ai_analyzer.js");
 
+// Enrollment token header for Tron API calls (only when configured).
+function agentAuthHeaders() {
+    return settings && settings.agentToken ? { 'X-Tron-Agent-Token': String(settings.agentToken) } : {};
+}
+
 // ─── Default Settings ────────────────────────────────────────
 const DEFAULT_SETTINGS = {
     enabled: true,
     apiUrl: "http://localhost:5001",
+    agentToken: "",           // enrollment token (TRON_AGENT_TOKEN), pushed via managed settings
     blockMode: "block",       // "warn" | "block" | "monitor"
     notifyOnDetection: true,
     reportToApi: true,
@@ -111,7 +117,7 @@ chrome.runtime.onInstalled.addListener(() => {
             getAgentIdentity().then(({ agentId }) => {
                 fetch(`${settings.apiUrl}/api/fleet/agents/${encodeURIComponent(agentId)}/operational`, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
+                    headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true', ...agentAuthHeaders() },
                     body: JSON.stringify({ event_type: 'extension_installed', message: 'Extension installed/loaded', details: { version: chrome.runtime.getManifest().version } })
                 }).catch(() => {});
             }).catch(() => {});
@@ -119,9 +125,27 @@ chrome.runtime.onInstalled.addListener(() => {
     }
 });
 
+// Enterprise policy (chrome.storage.managed, see managed_schema.json) wins over local settings
+// for the API endpoint and the enrollment token, so users cannot point the extension elsewhere.
+async function applyEnterprisePolicy() {
+    if (!chrome.storage || !chrome.storage.managed) return;
+    try {
+        const managed = await new Promise((resolve) => {
+            chrome.storage.managed.get(["apiUrl", "agentToken"], (items) => {
+                resolve(chrome.runtime.lastError ? {} : (items || {}));
+            });
+        });
+        if (typeof managed.apiUrl === "string" && managed.apiUrl) settings.apiUrl = managed.apiUrl;
+        if (typeof managed.agentToken === "string" && managed.agentToken) settings.agentToken = managed.agentToken;
+    } catch (_) {
+        // No managed policy on unmanaged browsers.
+    }
+}
+
 // Load settings on startup
-chrome.storage.local.get(["settings", "scanHistory", "stats", "dynamicPatterns", "detectorConfig", "pendingArtifactQueue", POLICY_HIT_TRACKER_STORAGE_KEY], (data) => {
+chrome.storage.local.get(["settings", "scanHistory", "stats", "dynamicPatterns", "detectorConfig", "pendingArtifactQueue", POLICY_HIT_TRACKER_STORAGE_KEY], async (data) => {
     if (data.settings) settings = { ...DEFAULT_SETTINGS, ...data.settings };
+    await applyEnterprisePolicy();
     if (data.scanHistory) scanHistory = data.scanHistory || [];
     if (data.stats) stats = { ...stats, ...data.stats };
     if (Array.isArray(data.pendingArtifactQueue)) pendingArtifactQueue = data.pendingArtifactQueue;
@@ -149,7 +173,7 @@ chrome.storage.local.get(["settings", "scanHistory", "stats", "dynamicPatterns",
         getAgentIdentity().then(({ agentId }) => {
             fetch(`${settings.apiUrl}/api/fleet/agents/${encodeURIComponent(agentId)}/operational`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
+                headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true', ...agentAuthHeaders() },
                 body: JSON.stringify({ event_type: 'extension_started', message: 'Extension started and policies synced', details: { version: chrome.runtime.getManifest().version } })
             }).catch(() => {});
         }).catch(() => {});
@@ -165,7 +189,7 @@ async function fleetCheckin() {
         const userIdentity = await getBestEffortUserIdentity();
         await fetch(`${settings.apiUrl}/api/fleet/checkin`, {
             method: "POST",
-            headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
+            headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true", ...agentAuthHeaders() },
             body: JSON.stringify({
                 agent_id: aid.agentId,
                 agent_type: "browser_extension",
@@ -371,7 +395,7 @@ async function captureScreenshot(domain, severity, findings) {
         const dataUrl = await chrome.tabs.captureVisibleTab(null, { format: "jpeg", quality: 60 });
         await fetch(`${settings.apiUrl}/api/screenshots`, {
             method: "POST",
-            headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
+            headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true", ...agentAuthHeaders() },
             body: JSON.stringify({
                 image_data: dataUrl,
                 domain: domain,
@@ -394,7 +418,7 @@ async function syncPolicies() {
         const aid = await getAgentIdentity();
         const syncUrl = `${settings.apiUrl}/api/policies/sync?agent_id=${encodeURIComponent(aid.agentId)}`;
         const response = await fetch(syncUrl, {
-            headers: { "ngrok-skip-browser-warning": "true" }
+            headers: { "ngrok-skip-browser-warning": "true", ...agentAuthHeaders() }
         });
         if (response.ok) {
             const data = await response.json();
@@ -525,7 +549,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             getAgentIdentity().then(({ agentId }) => {
                 fetch(`${settings.apiUrl}/api/fleet/agents/${encodeURIComponent(agentId)}/operational`, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
+                    headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true', ...agentAuthHeaders() },
                     body: JSON.stringify({ event_type: 'settings_updated', message: 'Extension settings updated', details: message.settings })
                 }).catch(() => {});
             }).catch(() => {});
@@ -611,7 +635,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             getAgentIdentity().then(({ agentId }) => {
                 fetch(`${settings.apiUrl}/api/fleet/agents/${encodeURIComponent(agentId)}/operational`, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
+                    headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true', ...agentAuthHeaders() },
                     body: JSON.stringify({
                         event_type: 'location_permission_status',
                         message: `Precise location ${status}`,
@@ -654,7 +678,7 @@ chrome.downloads.onCreated.addListener((downloadItem) => {
                         Promise.all([getBestEffortUserIdentity(), getAgentIdentity()]).then(([userIdentity, aid]) => {
                             fetch(`${settings.apiUrl}/api/scan/report`, {
                                 method: 'POST',
-                                headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
+                                headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true', ...agentAuthHeaders() },
                                 body: JSON.stringify({
                                     agent_id: aid.agentId,
                                     scan_type: 'web_download',
@@ -691,7 +715,7 @@ chrome.downloads.onChanged.addListener((delta) => {
             Promise.all([getBestEffortUserIdentity(), getAgentIdentity()]).then(([userIdentity, aid]) => {
                 fetch(`${settings.apiUrl}/api/scan/report`, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
+                    headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true', ...agentAuthHeaders() },
                     body: JSON.stringify({
                         agent_id: aid.agentId,
                         scan_type: 'web_download',
@@ -1343,7 +1367,7 @@ async function fetchServerDeepScan({ fileName, fileSize, domain, fileType, isIma
         const timeout = setTimeout(() => controller.abort(), timeoutMs);
         const res = await fetch(`${settings.apiUrl}/api/scan/browser-file`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
+            headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true', ...agentAuthHeaders() },
             signal: controller.signal,
             body: JSON.stringify({
                 file_name: fileName,
@@ -1707,7 +1731,7 @@ async function reportToApi(fileName, fileSize, domain, findings, severity, actio
 
         await fetch(`${settings.apiUrl}/api/browser/incident`, {
             method: "POST",
-            headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
+            headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true", ...agentAuthHeaders() },
             body: JSON.stringify(payload),
         });
     } catch (err) {
@@ -1801,7 +1825,7 @@ async function postArtifactPayload(payload) {
     try {
         const res = await fetch(`${settings.apiUrl}/api/browser/artifact`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
+            headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true', ...agentAuthHeaders() },
             body: JSON.stringify(payload)
         });
         if (!res.ok) return { ok: false, artifactId: null };
@@ -1837,7 +1861,7 @@ async function postRawArtifactMultipart(message) {
 
         const res = await fetch(`${apiUrl}/api/browser/artifact/raw`, {
             method: 'POST',
-            headers: { 'ngrok-skip-browser-warning': 'true' },
+            headers: { 'ngrok-skip-browser-warning': 'true', ...agentAuthHeaders() },
             body: fd,
         });
         if (!res.ok) return { ok: false };
