@@ -8,7 +8,7 @@ Open-source endpoint and web data loss prevention: agents and a Chrome extension
 [![Python 3.11](https://img.shields.io/badge/python-3.11-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![React 19](https://img.shields.io/badge/react-19-61DAFB.svg?logo=react&logoColor=black)](https://react.dev/)
 
-> **Status:** active development. Open-source endpoint and web DLP platform; contributions welcome. Before deploying in production, review the [Roadmap](#roadmap) (TLS and production WSGI, per-agent authentication for ingest endpoints) and the [Security notes](#security-notes).
+> **Status:** active development. Open-source endpoint and web DLP platform; contributions welcome. Before deploying in production, review the [Roadmap](#roadmap) (TLS and production WSGI, per-agent keys for ingest endpoints) and the [Security notes](#security-notes).
 
 ## What it does
 
@@ -148,6 +148,8 @@ Run the console separately with `cd siem-console && npm install && npm run dev`.
 | `VITE_API_BASE` | No | Console build-time API base URL (default `http://127.0.0.1:5001/api`). |
 | `APP_MAX_REQUEST_MB` | No | Maximum request body size (default 75 MB, enough for a base64-encoded 50 MB file). |
 | `TRON_BULK_THRESHOLD` | No | Identity/financial findings in one file that escalate it to critical (default 10). |
+| `TRON_AGENT_TOKEN` | Recommended | Enrollment token. When set, ingest endpoints (`/api/events`, `/api/fleet/*`, `/api/browser/*`, `/api/scan/*`, `/api/screenshots`, `/api/policies/sync`) require it in `X-Tron-Agent-Token`. Python agents read it from the same variable; the extension reads `agentToken` from enterprise policy. |
+| `TRON_UPDATE_PUBKEY` | Agents only | Base64 Ed25519 public key for verifying signed upgrades. If unset, the agent refuses remote upgrades. |
 | `TRON_EDM_DIR` / `TRON_EDM_KEY` | No | Exact Data Match index directory (default `data/edm`) and HMAC key (default: `data/edm/.key`, created on first build). |
 
 ### Load the Chrome extension
@@ -155,12 +157,15 @@ Run the console separately with `cd siem-console && npm install && npm run dev`.
 1. Open `chrome://extensions` and enable **Developer mode**.
 2. Click **Load unpacked** and select the `browser-extension/` folder.
 3. The extension reports to `http://localhost:5001` by default (`apiUrl` in `browser-extension/background.js`).
+4. For managed fleets, push `apiUrl` and `agentToken` through Chrome enterprise policy (schema: `browser-extension/managed_schema.json`). Policy values override local settings.
 
 ## Security notes
 
 - **Redaction before any external LLM call.** Server-side triage and rule generation pass all text through `redact_for_llm`, which runs the full detector library with keyword requirements ignored (over-redaction is the safe failure); the extension masks detector matches in file text and findings before calling Gemini. Limitation: when the extension's optional AI mode is enabled with a Gemini key, **image** uploads are sent to Gemini unredacted for OCR.
 - **Local storage keeps matched values.** Findings in the local SQLite database include the matched text so analysts can review them. Protect the `data/` directory accordingly.
 - **Auth model.** Console users authenticate with email and password (PBKDF2-SHA256, 200k iterations). Successful login creates a server-side session and returns a signed, time-limited bearer token (`itsdangerous`, default TTL 8h). Every request re-checks the session: revocation, expiry, idle timeout (default 120 min), and a cap on concurrent sessions. Repeated failed logins lock the account. Roles: `SUPER_ADMIN`, `SECURITY_ADMIN`, `SOC_ANALYST`, `VIEWER`, with per-permission RBAC and custom roles. Accounts flagged for a password change can only use self-service auth endpoints until they change it.
+- **Signed agent upgrades.** `POST /api/fleet/agents/<id>/upgrade` only accepts an `https` installer URL, its SHA-256 and an Ed25519 signature. Agents download the installer, verify the hash and the signature against the locally pinned `TRON_UPDATE_PUBKEY`, and only then execute it with a fixed argv (no shell). A compromised or impersonated API server cannot run code on endpoints. Sign releases with `scripts/sign_agent_update.py`.
+- **Agent enrollment token.** With `TRON_AGENT_TOKEN` set, unauthenticated callers can no longer inject events, spoof check-ins or poison the incident queue. The API warns at startup when it is unset.
 - **Server-side scans require a session.** `/api/scan/file` (reads paths on the API host) and `/api/scan/clipboard` require console authentication; request bodies are capped by `APP_MAX_REQUEST_MB`.
 - **CORS.** Console APIs only accept the origins in `APP_CORS_ORIGINS`. The unauthenticated ingest endpoints used by the extension's content script (`/api/browser/*`, `/api/scan/*`) accept any origin.
 - **No real data is committed.** Databases, captured artifacts, logs, `.env` and service account keys are git-ignored. `.env.example` contains placeholders only.
@@ -173,7 +178,7 @@ python -m pytest -q                       # OCR tests skip if tesseract is missi
 python scripts/benchmark_detection.py     # precision/recall + latency
 ```
 
-CI (`.github/workflows/ci.yml`) runs the tests, the benchmark, the extension parity check, the console build and a manifest check on every push.
+CI (`.github/workflows/ci.yml`) runs the tests, the benchmark, the extension parity check, the console build, a manifest check and a gitleaks history scan on every push. Actions are pinned to commit SHAs.
 
 ## Screenshots
 
@@ -182,7 +187,9 @@ Screenshots will live in [`docs/screenshots/`](docs/screenshots/).
 ## Roadmap
 
 - [ ] Production WSGI server and TLS guidance
-- [ ] Agent authentication (per-agent keys) for ingest endpoints
+- [x] Shared enrollment token for ingest endpoints (`TRON_AGENT_TOKEN`)
+- [ ] Per-agent keys with rotation
+- [x] Signed agent upgrades (Ed25519, pinned key)
 - [ ] Windows endpoint agent
 - [ ] Encrypted-at-rest findings and artifact retention policies
 - [ ] Indexed Document Matching (fingerprints of specific protected documents)

@@ -15,7 +15,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Application code (secrets and runtime data are excluded via .dockerignore)
 COPY . .
 
-RUN mkdir -p config data
+RUN mkdir -p config data \
+    && useradd --create-home --uid 10001 tron \
+    && chown -R tron:tron /app
+USER tron
 
 EXPOSE 5001
 
