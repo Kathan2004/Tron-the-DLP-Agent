@@ -27,6 +27,7 @@ from typing import List, Dict, Optional, Any
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from src.agent_updates import UpgradeRejected, agent_headers, apply_upgrade
 from src.file_scanner import FileContentScanner
 from src.detection.config import DetectorConfigStore
 from src.network_monitor import NetworkMonitor, ProcessMonitor, ShellHistoryScanner, BrowserHistoryScanner
@@ -73,26 +74,15 @@ class EndpointDLPAgent:
         self.agent_version = "1.1"
 
     def _handle_server_command(self, command: Optional[dict]):
-        """Handle server-issued control commands."""
-        if not isinstance(command, dict):
+        """Handle server-issued control commands. Only signed upgrades are accepted."""
+        if not isinstance(command, dict) or command.get('type') != 'upgrade':
             return
-        if command.get('type') != 'upgrade':
-            return
-
-        install_command = (command.get('install_command') or '').strip()
-        download_url = (command.get('download_url') or '').strip()
-        target = command.get('target_version') or 'latest'
-
         try:
-            if install_command:
-                print(f"  🔄 Upgrade command received (target {target}); executing install command")
-                subprocess.Popen(install_command, shell=True)
-            elif download_url:
-                print(f"  🔄 Upgrade command received (target {target}); executing remote installer")
-                safe_cmd = f"curl -fsSL '{download_url}' | bash"
-                subprocess.Popen(safe_cmd, shell=True)
+            print(f"  Upgrade command received: {apply_upgrade(command)}")
+        except UpgradeRejected as e:
+            print(f"  Upgrade rejected: {e}")
         except Exception as e:
-            print(f"  ⚠️ Upgrade command failed: {e}")
+            print(f"  Upgrade failed: {e}")
 
     def send_event(self, channel: str, payload: str, metadata: Optional[dict] = None) -> bool:
         """Send detection event to DLP API."""
@@ -109,7 +99,8 @@ class EndpointDLPAgent:
             response = requests.post(
                 f"{self.api_url}/api/events",
                 json=event_data,
-                timeout=5
+                timeout=5,
+                headers=agent_headers(),
             )
 
             if response.status_code == 200:
@@ -131,7 +122,7 @@ class EndpointDLPAgent:
     def sync_policies(self):
         """Sync active policies from API."""
         try:
-            response = requests.get(f"{self.api_url}/api/policies/sync", timeout=5)
+            response = requests.get(f"{self.api_url}/api/policies/sync", timeout=5, headers=agent_headers())
             if response.status_code == 200:
                 data = response.json()
                 self.active_policies = data.get('patterns', [])
@@ -198,7 +189,7 @@ class EndpointDLPAgent:
                     "screens_scanned": self._stats.get("process_scans", 0)
                 }
             }
-            res = requests.post(f"{self.api_url}/api/fleet/checkin", json=payload, timeout=5)
+            res = requests.post(f"{self.api_url}/api/fleet/checkin", json=payload, timeout=5, headers=agent_headers())
             if res.ok:
                 body = res.json() if res.content else {}
                 cmd = body.get('command') if isinstance(body, dict) else None

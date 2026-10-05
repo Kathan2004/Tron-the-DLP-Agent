@@ -14,13 +14,13 @@ import time
 import threading
 import signal
 import hashlib
-import subprocess
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from src.agent_updates import UpgradeRejected, agent_headers, apply_upgrade
 from src.file_scanner import FileContentScanner
 from src.detection.config import DetectorConfigStore
 from src.network_monitor import BrowserHistoryScanner
@@ -56,20 +56,16 @@ class WebDLPAgent:
         }
         self.agent_version = "1.1"
 
-    def _handle_server_command(self, command):
-        if not isinstance(command, dict):
+    def _handle_server_command(self, command: Optional[dict]):
+        """Handle server-issued control commands. Only signed upgrades are accepted."""
+        if not isinstance(command, dict) or command.get('type') != 'upgrade':
             return
-        if command.get('type') != 'upgrade':
-            return
-        install_command = (command.get('install_command') or '').strip()
-        download_url = (command.get('download_url') or '').strip()
         try:
-            if install_command:
-                subprocess.Popen(install_command, shell=True)
-            elif download_url:
-                subprocess.Popen(f"curl -fsSL '{download_url}' | bash", shell=True)
+            print(f"  Upgrade command received: {apply_upgrade(command)}")
+        except UpgradeRejected as e:
+            print(f"  Upgrade rejected: {e}")
         except Exception as e:
-            print(f"  ⚠️ Upgrade command failed: {e}")
+            print(f"  Upgrade failed: {e}")
 
     def evaluate_policies(self, file_path: Optional[str] = None, text: Optional[str] = None,
                           metadata: Optional[dict] = None) -> List[Dict]:
@@ -143,7 +139,8 @@ class WebDLPAgent:
             response = requests.post(
                 f"{self.api_url}/api/events",
                 json=event_data,
-                timeout=5
+                timeout=5,
+                headers=agent_headers(),
             )
 
             if response.status_code == 200:
@@ -162,7 +159,7 @@ class WebDLPAgent:
     def sync_policies(self):
         """Sync active policies from API."""
         try:
-            response = requests.get(f"{self.api_url}/api/policies/sync", timeout=5)
+            response = requests.get(f"{self.api_url}/api/policies/sync", timeout=5, headers=agent_headers())
             if response.status_code == 200:
                 data = response.json()
                 self.active_policies = data.get('patterns', [])
@@ -188,7 +185,7 @@ class WebDLPAgent:
                     "python_version": sys.version.split()[0]
                 }
             }
-            res = requests.post(f"{self.api_url}/api/fleet/checkin", json=payload, timeout=5)
+            res = requests.post(f"{self.api_url}/api/fleet/checkin", json=payload, timeout=5, headers=agent_headers())
             if res.ok:
                 body = res.json() if res.content else {}
                 self._handle_server_command(body.get('command'))

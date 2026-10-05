@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "properties": {
+    "apiUrl": {
+      "title": "Tron API URL",
+      "description": "Base URL of the Tron DLP API, e.g. https://dlp.example.com",
+      "type": "string"
+    },
+    "agentToken": {
+      "title": "Agent enrollment token",
+      "description": "Must match TRON_AGENT_TOKEN on the API server.",
+      "type": "string"
+    }
+  }
+}

@@ -12,3 +12,4 @@ pypdfium2>=4.30,<6       # PDF text layer + page rendering for OCR (no poppler n
 pypdf>=4.3               # fallback PDF reader, encryption handling
 Pillow>=10.4
 pytesseract==0.3.13      # needs the tesseract binary (brew install tesseract / apt install tesseract-ocr)
+cryptography>=42
