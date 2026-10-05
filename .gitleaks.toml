@@ -1,0 +1,11 @@
+# The detection test corpus and fixtures contain synthetic secrets on purpose.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "DLP detection test data"
+paths = [
+  '''^tests/detection_corpus\.py$''',
+  '''^tests/fixtures\.py$''',
+  '''^tests/js_scan\.js$''',
+]
