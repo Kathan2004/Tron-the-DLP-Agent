@@ -1,10 +1,10 @@
 # Tron DLP Agent v2.0 — Dependencies
 # API / alerting
-flask==3.0.0
-flask-cors==4.0.0
+flask==3.1.3
+flask-cors==6.0.0
 python-telegram-bot==21.0
-requests==2.31.0
-python-dotenv==1.0.0
+requests==2.33.0
+python-dotenv==1.2.2
 # Endpoint agents
 watchdog==4.0.0
 # Content extraction (replaces Docling: no torch / model downloads)
