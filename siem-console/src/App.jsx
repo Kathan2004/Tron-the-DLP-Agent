@@ -13,11 +13,15 @@ import Login from './pages/Login';
 import Profile from './pages/Profile';
 import Governance from './pages/Governance';
 import Detectors from './pages/Detectors';
+import Platform from './pages/Platform';
+import ProtectedDocuments from './pages/ProtectedDocuments';
 import TronLogo from './components/TronLogo';
 import Icon from './components/Icons';
 import { runSoon } from './utils';
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:5001/api';
+// Production builds are served from the same origin as the API (reverse proxy), so the
+// default is relative; the dev server talks to a local API.
+const API_BASE = import.meta.env.VITE_API_BASE || (import.meta.env.DEV ? 'http://127.0.0.1:5001/api' : '/api');
 
 const LIGHT_THEME_VARS = {
   '--bg-color': '#ffffff',
@@ -126,6 +130,8 @@ function App() {
     if (initialHash.startsWith('#/governance') || initialHash === '#/users') return 'admin';
     if (initialHash === '#/lab') return 'lab';
     if (initialHash === '#/detectors') return 'detectors';
+    if (initialHash === '#/documents') return 'documents';
+    if (initialHash === '#/platform') return 'platform';
     return 'dashboard';
   })();
 
@@ -426,8 +432,22 @@ function App() {
     let eventSource;
     let retryTimeout;
 
-    const connect = () => {
-      eventSource = new EventSource(`${API_BASE}/stream`);
+    let cancelled = false;
+
+    const connect = async () => {
+      // EventSource cannot send the bearer token; trade the session for a 60 s stream ticket.
+      let ticket = '';
+      try {
+        const res = await fetch(`${API_BASE}/stream/ticket`, { method: 'POST' });
+        if (res.ok) ticket = (await res.json()).ticket || '';
+      } catch (_) { /* retried below */ }
+      if (cancelled) return;
+      if (!ticket) {
+        setSseConnected(false);
+        retryTimeout = setTimeout(connect, 5000);
+        return;
+      }
+      eventSource = new EventSource(`${API_BASE}/stream?ticket=${encodeURIComponent(ticket)}`);
 
       eventSource.onopen = () => {
         setSseConnected(true);
@@ -467,6 +487,7 @@ function App() {
     connect();
 
     return () => {
+      cancelled = true;
       if (eventSource) eventSource.close();
       if (retryTimeout) clearTimeout(retryTimeout);
     };
@@ -527,6 +548,8 @@ function App() {
         '#/users': 'admin',
         '#/lab': 'lab',
         '#/detectors': 'detectors',
+        '#/documents': 'documents',
+        '#/platform': 'platform',
       };
       if (tabMap[h]) {
         setSelectedIncidentId(null);
@@ -556,6 +579,8 @@ function App() {
     else if (activeTab === 'admin') next = current.startsWith('#/governance') ? current : '#/governance/overview';
     else if (activeTab === 'lab') next = '#/lab';
     else if (activeTab === 'detectors') next = '#/detectors';
+    else if (activeTab === 'documents') next = '#/documents';
+    else if (activeTab === 'platform') next = '#/platform';
 
     if (next && current !== next) {
       window.history.replaceState(null, '', `${window.location.pathname}${next}`);
@@ -599,6 +624,8 @@ function App() {
     if (activeTab === 'profile') return 'Profile & Settings';
     if (activeTab === 'admin') return 'IAM & Governance';
     if (activeTab === 'lab') return 'Detection Lab';
+    if (activeTab === 'documents') return 'Protected Documents';
+    if (activeTab === 'platform') return 'Platform & Security';
     return 'Overview';
   };
 
@@ -610,6 +637,8 @@ function App() {
     policies: 'What to detect, how often, and what to do when it happens',
     detectors: 'Data identifiers with checksum validation and keyword context; tune or add your own',
     exceptions: 'Scoped allow rules for users, senders and destinations',
+    documents: 'Fingerprint confidential documents so copies and excerpts are detected',
+    platform: 'Encryption, agent keys, data retention and SIEM forwarding',
     profile: 'Your account, preferences and sessions',
     admin: 'Users, roles, permissions and governance settings',
     lab: 'Build and test detectors, verify checksums and generate safe test data',
@@ -628,6 +657,8 @@ function App() {
     if (tabId === 'exceptions') return can('exceptions.view');
     if (tabId === 'admin') return can('users.manage') || can('iam.manage');
     if (tabId === 'lab') return can('ai_lab.manage');
+    if (tabId === 'documents') return can('policies.view');
+    if (tabId === 'platform') return can('settings.manage') || can('fleet.manage');
     return false;
   };
 
@@ -646,6 +677,7 @@ function App() {
       items: [
         can('policies.view') && { id: 'policies', icon: 'policy', label: 'Policies' },
         can('policies.view') && { id: 'detectors', icon: 'detector', label: 'Detectors' },
+        can('policies.view') && { id: 'documents', icon: 'file', label: 'Protected Documents' },
         can('exceptions.view') && { id: 'exceptions', icon: 'exception', label: 'Exceptions' },
         can('ai_lab.manage') && { id: 'lab', icon: 'lab', label: 'Detection Lab' },
       ].filter(Boolean),
@@ -654,6 +686,7 @@ function App() {
       label: 'Administration',
       items: [
         (can('users.manage') || can('iam.manage')) && { id: 'admin', icon: 'admin', label: 'IAM & Governance' },
+        (can('settings.manage') || can('fleet.manage')) && { id: 'platform', icon: 'key', label: 'Platform & Security' },
         { id: 'profile', icon: 'user', label: 'Profile' },
       ].filter(Boolean),
     },
@@ -671,6 +704,8 @@ function App() {
     if (tabId === 'profile') return '#/profile';
     if (tabId === 'lab') return '#/lab';
     if (tabId === 'detectors') return '#/detectors';
+    if (tabId === 'documents') return '#/documents';
+    if (tabId === 'platform') return '#/platform';
     return '#/dashboard';
   };
 
@@ -872,6 +907,8 @@ function App() {
         )}
         {activeTab === 'admin' && <Governance apiBase={API_BASE} currentUser={authUser} notify={pushToast} confirmAction={askConfirm} />}
         {activeTab === 'lab' && <Lab apiBase={API_BASE} notify={pushToast} canManage={can('policies.manage')} />}
+        {activeTab === 'documents' && <ProtectedDocuments apiBase={API_BASE} notify={pushToast} confirmAction={askConfirm} canManage={can('policies.manage')} />}
+        {activeTab === 'platform' && <Platform apiBase={API_BASE} notify={pushToast} confirmAction={askConfirm} canSettings={can('settings.manage')} canFleet={can('fleet.manage')} />}
         {activeTab === 'detectors' && <Detectors apiBase={API_BASE} notify={pushToast} confirmAction={askConfirm} canManage={can('policies.manage')} />}
       </main>
 

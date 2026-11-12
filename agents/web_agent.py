@@ -20,7 +20,9 @@ from typing import Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.agent_updates import UpgradeRejected, agent_headers, apply_upgrade
+from src import platform_support
+from src.agent_client import AgentClient, safe_agent_id
+from src.agent_updates import UpgradeRejected, apply_upgrade
 from src.file_scanner import FileContentScanner
 from src.detection.config import DetectorConfigStore
 from src.network_monitor import BrowserHistoryScanner
@@ -33,8 +35,10 @@ class WebDLPAgent:
     def __init__(self, api_url="http://localhost:5001"):
         self.api_url = api_url
         self.agent_type = "web_agent"
-        self.user = os.getenv("USER", "unknown")
-        self.host = os.getenv("HOSTNAME", os.uname().nodename)
+        self.user = platform_support.username()
+        self.host = platform_support.hostname()
+        self.client = AgentClient(self.api_url, safe_agent_id("web-agent", self.host, self.user),
+                                  self.agent_type, self.host)
         self.session_id = hashlib.md5(f"web-{time.time()}".encode()).hexdigest()[:8]
         self.active_policies = []
 
@@ -58,6 +62,8 @@ class WebDLPAgent:
 
     def _handle_server_command(self, command: Optional[dict]):
         """Handle server-issued control commands. Only signed upgrades are accepted."""
+        if self.client.handle_command(command):
+            return
         if not isinstance(command, dict) or command.get('type') != 'upgrade':
             return
         try:
@@ -136,14 +142,9 @@ class WebDLPAgent:
                 "geo": metadata or {}
             }
 
-            response = requests.post(
-                f"{self.api_url}/api/events",
-                json=event_data,
-                timeout=5,
-                headers=agent_headers(),
-            )
+            response = self.client.post("/api/events", event_data, spool=True)
 
-            if response.status_code == 200:
+            if response is not None and response.status_code == 200:
                 self._stats["alerts_sent"] += 1
                 result = response.json()
                 print(f"  ✅ Event sent: {result.get('event_id')} | {channel}")
@@ -159,8 +160,8 @@ class WebDLPAgent:
     def sync_policies(self):
         """Sync active policies from API."""
         try:
-            response = requests.get(f"{self.api_url}/api/policies/sync", timeout=5, headers=agent_headers())
-            if response.status_code == 200:
+            response = self.client.get("/api/policies/sync", params={"agent_id": self.client.agent_id})
+            if response is not None and response.status_code == 200:
                 data = response.json()
                 self.active_policies = data.get('patterns', [])
                 # print(f"  🔄 Synced {len(self.active_policies)} policies")
@@ -171,10 +172,10 @@ class WebDLPAgent:
         """Register agent with fleet management."""
         try:
             payload = {
-                "agent_id": f"web-agent-{self.host}-{self.user}",
+                "agent_id": self.client.agent_id,
                 "agent_type": self.agent_type,
                 "hostname": self.host,
-                "os": sys.platform,
+                "os": platform_support.os_label(),
                 "user": self.user,
                 "version": self.agent_version,
                 "scans_reported": self._stats["scans"],
@@ -185,8 +186,8 @@ class WebDLPAgent:
                     "python_version": sys.version.split()[0]
                 }
             }
-            res = requests.post(f"{self.api_url}/api/fleet/checkin", json=payload, timeout=5, headers=agent_headers())
-            if res.ok:
+            res = self.client.post("/api/fleet/checkin", payload)
+            if res is not None and res.ok:
                 body = res.json() if res.content else {}
                 self._handle_server_command(body.get('command'))
         except Exception:
