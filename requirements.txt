@@ -1,15 +1,17 @@
-# Tron DLP Agent v2.0 — Dependencies
-# API / alerting
-flask==3.0.0
-flask-cors==4.0.0
-python-telegram-bot==21.0
-requests==2.31.0
-python-dotenv==1.0.0
+# Tron DLP: runtime dependencies (API and Python agents)
+# API
+flask>=3.1.3,<4
+flask-cors>=6.0.0,<7
+gunicorn>=23,<28
+python-dotenv>=1.2.2,<2
+requests>=2.33.0,<3
+cryptography>=44
+# Alerting
+python-telegram-bot>=21.0,<23
 # Endpoint agents
-watchdog==4.0.0
-# Content extraction (replaces Docling: no torch / model downloads)
+watchdog>=4.0.0,<7
+# Content extraction
 pypdfium2>=4.30,<6       # PDF text layer + page rendering for OCR (no poppler needed)
-pypdf>=4.3               # fallback PDF reader, encryption handling
-Pillow>=10.4
+pypdf>=5.0               # fallback PDF reader, encryption handling
+Pillow>=11.0
 pytesseract==0.3.13      # needs the tesseract binary (brew install tesseract / apt install tesseract-ocr)
-cryptography>=42

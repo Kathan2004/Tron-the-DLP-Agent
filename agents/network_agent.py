@@ -5,11 +5,9 @@ Monitors actual network traffic for data exfiltration.
 No simulation — all real monitoring using native OS tools.
 """
 
-import os
 import sys
 import json
 import requests
-import re
 import time
 import signal
 import hashlib
@@ -87,13 +85,13 @@ class NetworkDLPAgent:
             if response is not None and response.status_code == 200:
                 self._stats["alerts_sent"] += 1
                 result = response.json()
-                print(f"  ✅ Event sent: {result.get('event_id')} | {channel}")
+                print(f"  Event sent: {result.get('event_id')} | {channel}")
                 return True
 
         except requests.exceptions.ConnectionError:
-            print(f"  ⚠️  Cannot reach API at {self.api_url}")
+            print(f"   Cannot reach API at {self.api_url}")
         except Exception as e:
-            print(f"  ⚠️  Error: {e}")
+            print(f"   Error: {e}")
 
         return False
 
@@ -139,7 +137,7 @@ class NetworkDLPAgent:
         for event in events:
             self._stats["exfiltration_attempts"] += 1
 
-            print(f"\n  🚨 [{event.risk_level.upper()}] {event.event_type}")
+            print(f"\n  [{event.risk_level.upper()}] {event.event_type}")
             print(f"     Process: {event.process} (PID: {event.pid})")
             print(f"     Target: {event.domain or event.remote_addr}:{event.remote_port}")
             print(f"     {event.details}")
@@ -174,7 +172,7 @@ class NetworkDLPAgent:
             bytes_out = volume.get("bytes_out", 0)
             # Alert if outbound exceeds threshold (100MB in one check)
             if bytes_out > 100_000_000:
-                print(f"\n  📊 HIGH OUTBOUND: {bytes_out / 1_000_000:.1f} MB")
+                print(f"\n  HIGH OUTBOUND: {bytes_out / 1_000_000:.1f} MB")
                 self.send_event(
                     user=self.user,
                     host=self.host,
@@ -195,7 +193,7 @@ class NetworkDLPAgent:
             if process not in safe_processes:
                 addr = listener.get("address", "")
                 if "0.0.0.0" in addr or "*:" in addr:
-                    print(f"\n  ⚠️  LISTENING: {listener['process']} on {addr}")
+                    print(f"\n   LISTENING: {listener['process']} on {addr}")
 
                     self.db.add_scan_result(
                         scan_type="network",
@@ -214,7 +212,7 @@ class NetworkDLPAgent:
         risky = [e for e in (chrome + safari) if e.get('risk') == 'high']
 
         for entry in risky[:3]:
-            print(f"\n  🌐 RISKY SITE: {entry['url'][:60]}")
+            print(f"\n  RISKY SITE: {entry['url'][:60]}")
             self.send_event(
                 user=self.user,
                 host=self.host,
@@ -229,7 +227,7 @@ class NetworkDLPAgent:
 
         if findings:
             pattern_names = list(set(f.pattern_name for f in findings))
-            print(f"\n  🚨 EMAIL: Sensitive data from {sender}")
+            print(f"\n  EMAIL: Sensitive data from {sender}")
             print(f"     Patterns: {', '.join(pattern_names)}")
 
             self.db.add_scan_result(
@@ -259,7 +257,7 @@ class NetworkDLPAgent:
 
         if result and result.findings:
             pattern_names = list(set(f.pattern_name for f in result.findings))
-            print(f"\n  🚨 CLOUD UPLOAD: {user} -> {destination}")
+            print(f"\n  CLOUD UPLOAD: {user} -> {destination}")
             print(f"     File: {filename}")
             print(f"     Patterns: {', '.join(pattern_names)}")
 
@@ -284,7 +282,7 @@ class NetworkDLPAgent:
 
         if findings:
             pattern_names = list(set(f.pattern_name for f in findings))
-            print(f"\n  🚨 HTTP EXFILTRATION: {user} -> {destination}")
+            print(f"\n  HTTP EXFILTRATION: {user} -> {destination}")
 
             return self.send_event(
                 user=user,
@@ -304,21 +302,21 @@ class NetworkDLPAgent:
 
         print(f"""
 ╔══════════════════════════════════════════════════════╗
-║  🌐 TRON NETWORK DLP AGENT                      ║
+║  TRON NETWORK DLP AGENT                      ║
 ║  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━   ║
-║  📱 Host:    {self.host:<39} ║
-║  👤 User:    {self.user:<39} ║
-║  🔗 API:     {self.api_url:<39} ║
-║  🆔 Session: {self.session_id:<39} ║
+║  Host:    {self.host:<39} ║
+║  User:    {self.user:<39} ║
+║  API:     {self.api_url:<39} ║
+║  Session: {self.session_id:<39} ║
 ║  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━   ║
 ║  MONITORS:                                           ║
-║    ✅ Active connection monitoring (lsof)            ║
-║    ✅ Cloud storage detection                        ║
-║    ✅ Suspicious port detection                      ║
-║    ✅ SSH tunnel detection                           ║
-║    ✅ Data volume monitoring                         ║
-║    ✅ Listening port detection                       ║
-║    ✅ Browser history scanning                       ║
+║    Active connection monitoring (lsof)            ║
+║    Cloud storage detection                        ║
+║    Suspicious port detection                      ║
+║    SSH tunnel detection                           ║
+║    Data volume monitoring                         ║
+║    Listening port detection                       ║
+║    Browser history scanning                       ║
 ║  Status: MONITORING                                  ║
 ╚══════════════════════════════════════════════════════╝
         """)
@@ -340,10 +338,10 @@ class NetworkDLPAgent:
                 scan_count += 1
                 timestamp = datetime.now().strftime('%H:%M:%S')
 
-                print(f"\n⏱️  Network scan #{scan_count} at {timestamp}", end="")
+                print(f"\n Network scan #{scan_count} at {timestamp}", end="")
 
                 # Connection monitoring (every scan)
-                alert_count = self.monitor_connections()
+                self.monitor_connections()
 
                 # Data volume check (every scan)
                 self.monitor_data_volume()
@@ -368,8 +366,8 @@ class NetworkDLPAgent:
         except KeyboardInterrupt:
             pass
 
-        print(f"\n\n🛑 Network agent stopped")
-        print(f"📊 Stats: {json.dumps(self._stats, indent=2)}")
+        print("\n\nNetwork agent stopped")
+        print(f"Stats: {json.dumps(self._stats, indent=2)}")
 
 
 if __name__ == "__main__":

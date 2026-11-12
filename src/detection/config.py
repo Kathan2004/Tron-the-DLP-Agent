@@ -255,7 +255,7 @@ class DetectorConfigStore:
                     overrides = self.db.get_detector_overrides()
                     customs = self.db.list_custom_detectors()
                 except Exception as e:
-                    print(f"⚠️ Detector config not loaded: {e}")
+                    print(f"Detector config not loaded: {e}")
             # Drop stored entries that no longer validate (e.g. a validator was removed).
             customs = [c for c in customs if not validate_custom(c)[1]]
             self._overrides, self._customs = overrides, customs

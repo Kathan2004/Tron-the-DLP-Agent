@@ -201,7 +201,7 @@ def load_indexes(directory: Path = DEFAULT_DIR) -> List[EDMIndex]:
         try:
             out.append(EDMIndex.load(str(p)))
         except Exception as e:
-            print(f"⚠️  EDM index {p.name} not loaded: {e}")
+            print(f" EDM index {p.name} not loaded: {e}")
     return out
 
 

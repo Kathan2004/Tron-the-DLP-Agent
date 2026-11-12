@@ -332,7 +332,7 @@ class FileContentScanner:
                 if result and result.findings:
                     results.append(result)
             except Exception as e:
-                print(f"⚠️  Error scanning {path}: {e}")
+                print(f" Error scanning {path}: {e}")
         return results
 
     def scan_clipboard(self) -> List[ScanFinding]:

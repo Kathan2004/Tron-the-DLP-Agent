@@ -8,13 +8,11 @@ Scans file contents on creation/modification and alerts on sensitive data.
 import os
 import sys
 import time
-import hashlib
 import threading
 import json
-import requests
 from pathlib import Path
-from datetime import datetime, timedelta
-from typing import Dict, List, Set, Optional
+from datetime import datetime
+from typing import Dict, List, Set
 from collections import defaultdict
 
 try:
@@ -23,7 +21,7 @@ try:
     HAS_WATCHDOG = True
 except ImportError:
     HAS_WATCHDOG = False
-    print("⚠️  watchdog not installed. Install with: pip install watchdog")
+    print(" watchdog not installed. Install with: pip install watchdog")
 
 # Add parent dir
 sys.path.insert(0, str(Path(__file__).parent.parent))

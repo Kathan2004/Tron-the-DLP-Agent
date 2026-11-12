@@ -4,10 +4,6 @@ Wraps the SQLite database with the same interface used by the rest of the system
 Drop-in replacement for the original in-memory IncidentStore.
 """
 
-import json
-import uuid
-import hashlib
-from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass, asdict
 from enum import Enum
@@ -200,9 +196,9 @@ class IncidentStore:
             self.alert_buffer[evt.user].append(evt)
 
         if self.incidents:
-            print(f"  📂 Loaded {len(self.incidents)} incidents from database")
+            print(f"  Loaded {len(self.incidents)} incidents from database")
         if self.events:
-            print(f"  📂 Loaded {len(self.events)} events from database")
+            print(f"  Loaded {len(self.events)} events from database")
 
     def add_event(self, event: Event) -> None:
         """Store event in database and memory."""

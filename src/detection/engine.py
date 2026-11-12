@@ -288,7 +288,6 @@ class DetectionEngine:
         det = _compile_detector(definition, source="trace")
         norm = normalize_text(text or "")
         lower = norm.lower()
-        has_kw_anywhere = bool(det.keyword_re and _find_keyword(det.keyword_re, lower, 0, len(lower)))
         out = []
         for m in det.regex.finditer(norm):
             try:
