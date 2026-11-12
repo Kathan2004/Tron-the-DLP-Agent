@@ -28,6 +28,14 @@ from src.crypto import DataCipher, _decode_key, generate_key
 
 log = logging.getLogger("tron.agent")
 
+# Agents started from a checkout pick up TRON_AGENT_TOKEN / TRON_UPDATE_PUBKEY from the
+# project's .env; real environment variables win.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(os.getenv("TRON_ENV_FILE") or Path(__file__).resolve().parent.parent / ".env"), override=False)
+except ImportError:
+    pass
+
 SPOOL_MAX_ENTRIES = 5000
 SPOOL_MAX_BYTES = 20 * 1024 * 1024
 _ID_UNSAFE = re.compile(r"[^A-Za-z0-9._:@-]+")

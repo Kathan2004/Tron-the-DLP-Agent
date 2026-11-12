@@ -1,51 +1,45 @@
 #!/bin/bash
+# Tron DLP: local development setup (virtualenv, dependencies, .env).
+set -euo pipefail
+cd "$(dirname "$0")"
 
-# TRON THE DLP AGENT System Setup Script
+command -v python3 >/dev/null || { echo "python3 not found"; exit 1; }
+echo "Python: $(python3 --version)"
 
-set -e
-
-echo "🛡️ TRON THE DLP AGENT System Setup"
-echo "=============================="
-echo
-
-# Check Python
-if ! command -v python3 &> /dev/null; then
-    echo "❌ Python 3 not found"
-    exit 1
-fi
-
-echo "✅ Python 3 found: $(python3 --version)"
-
-# Create virtual environment
-echo "Creating virtual environment..."
 python3 -m venv venv
+# shellcheck disable=SC1091
 source venv/bin/activate
+pip install --quiet --upgrade pip
+pip install --quiet -r requirements.txt
 
-# Install dependencies
-echo "Installing dependencies..."
-pip install --upgrade pip
-pip install -r requirements.txt
-
-# Setup config
-echo "Setting up configuration..."
 if [ ! -f .env ]; then
     cp .env.example .env
-    echo "⚠️  Created .env file - PLEASE configure it with your credentials"
+    chmod 600 .env
+    # Generate the secrets that should never keep a placeholder value.
+    python3 - <<'PY'
+import base64, os, re, secrets
+text = open(".env").read()
+values = {
+    "APP_AUTH_SECRET": secrets.token_urlsafe(48),
+    "TRON_AGENT_TOKEN": secrets.token_urlsafe(32),
+    "TRON_DATA_KEY": base64.urlsafe_b64encode(os.urandom(32)).decode(),
+}
+for key, value in values.items():
+    text = re.sub(rf"(?m)^{key}=.*$", f"{key}={value}", text)
+open(".env", "w").write(text)
+PY
+    echo "Created .env with generated APP_AUTH_SECRET, TRON_AGENT_TOKEN and TRON_DATA_KEY."
+    echo "Back up TRON_DATA_KEY: stored findings cannot be decrypted without it."
 fi
 
-# Validate service account
-if [ ! -f config/service-account.json ]; then
-    echo "❌ Service account JSON not found"
-    echo "Place your GCP service account key at config/service-account.json"
-    exit 1
-fi
+command -v tesseract >/dev/null || echo "Note: tesseract not found; images and scanned PDFs will be reported as not inspected."
 
-echo
-echo "✅ Setup complete!"
-echo
-echo "Next steps:"
-echo "1. Edit .env (see README: APP_AUTH_SECRET, TELEGRAM_BOT_TOKEN, GCP_PROJECT_ID, ...)"
-echo "2. Run: ./start   (API + console)   or   ./start_all.sh   (API + agents)"
-echo
-echo "Or use Docker:"
-echo "docker compose up -d"
+cat <<'MSG'
+
+Setup complete.
+  ./start          API (127.0.0.1:5001) + console (localhost:5173)
+  ./start_all.sh   API + endpoint, network and web agents
+  docker compose up -d --build     API + console in containers (http://127.0.0.1:8080)
+
+On first start the API prints a one-time admin password unless APP_ADMIN_PASSWORD is set.
+MSG

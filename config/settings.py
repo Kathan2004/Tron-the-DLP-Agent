@@ -12,11 +12,6 @@ class Config:
     _chat_id = os.getenv("SECURITY_CHAT_ID", "").strip()
     SECURITY_CHAT_ID = int(_chat_id) if _chat_id else 0
     
-    # Google Cloud
-    GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
-    GCP_CREDENTIALS_PATH = os.getenv("GCP_CREDENTIALS_PATH", "./config/service-account.json")
-    GCP_REGION = "us-central1"
-    
     # Google Generative AI (Gemini)
     GOOGLE_GENAI_API_KEY = os.getenv("GOOGLE_GENAI_API_KEY")
     
@@ -38,8 +33,3 @@ class Config:
     FP_AUTO_CLOSE_THRESHOLD = 0.85  # Close if FP prob > 85%
     INCIDENT_TRIGGER_THRESHOLD = 3  # Trigger AI analysis after N alerts
     INCIDENT_TIME_WINDOW = 30 * 60  # 30 minutes in seconds
-    
-    # Vertex AI Model
-    VERTEX_AI_MODEL = "gemini-1.5-flash"  # Using Gemini on Vertex AI
-    MAX_TOKENS = 500
-    TEMPERATURE = 0.3

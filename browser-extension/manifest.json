@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
-    "name": "TRON THE DLP AGENT — File Upload Guard",
-    "version": "1.0.2",
+    "name": "Tron DLP - Upload Guard",
+    "version": "2.1.0",
     "description": "Scans files for sensitive data before they are uploaded to any website. Part of the TRON THE DLP AGENT system.",
     "permissions": [
         "storage",

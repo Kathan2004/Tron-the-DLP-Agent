@@ -107,17 +107,17 @@ class EndpointDLPAgent:
             if response is not None and response.status_code == 200:
                 result = response.json()
                 self._stats["events_sent"] += 1
-                print(f"  ✅ Event sent: {result.get('event_id')} | Channel: {channel}")
+                print(f"  Event sent: {result.get('event_id')} | Channel: {channel}")
                 return True
             else:
                 print(f"  API unavailable ({response.status_code if response is not None else 'unreachable'}); event spooled for retry")
                 return False
 
         except requests.exceptions.ConnectionError:
-            print(f"  ⚠️  Cannot reach API at {self.api_url}")
+            print(f"   Cannot reach API at {self.api_url}")
             return False
         except Exception as e:
-            print(f"  ⚠️  Error sending event: {e}")
+            print(f"   Error sending event: {e}")
             return False
 
     def sync_policies(self):
@@ -233,7 +233,7 @@ class EndpointDLPAgent:
                 pattern_names = list(set(f.pattern_name for f in findings))
                 severity = max(findings, key=lambda f: {"critical": 4, "high": 3, "medium": 2, "low": 1}.get(f.severity, 0)).severity
 
-                print(f"\n  🚨 CLIPBOARD: Sensitive data detected!")
+                print("\n  CLIPBOARD: Sensitive data detected!")
                 print(f"     Patterns: {', '.join(pattern_names)}")
                 print(f"     Severity: {severity.upper()}")
 
@@ -263,7 +263,7 @@ class EndpointDLPAgent:
         except subprocess.TimeoutExpired:
             pass
         except Exception as e:
-            print(f"  ⚠️  Clipboard error: {e}")
+            print(f"   Clipboard error: {e}")
 
         return False
 
@@ -301,7 +301,7 @@ class EndpointDLPAgent:
                     # 1. Evaluate advanced policies (size, extension, etc)
                     policy_findings = self.evaluate_policies(file_path=str(file_path))
                     for pf in policy_findings:
-                        print(f"\n  🚨 POLICY VIOLATION: {pf['name']} ({pf['action'].upper()})")
+                        print(f"\n  POLICY VIOLATION: {pf['name']} ({pf['action'].upper()})")
                         print(f"     File: {file_path.name} | Details: {pf['details']}")
                         
                         self.db.add_scan_result(
@@ -327,7 +327,7 @@ class EndpointDLPAgent:
                         detected = True
 
                         pattern_names = list(set(f.pattern_name for f in result.findings))
-                        print(f"\n  🚨 FILE: Sensitive data in {file_path.name}")
+                        print(f"\n  FILE: Sensitive data in {file_path.name}")
                         print(f"     Patterns: {', '.join(pattern_names)}")
                         print(f"     Severity: {result.severity.upper()}")
                         print(f"     Findings: {len(result.findings)}")
@@ -360,7 +360,7 @@ class EndpointDLPAgent:
                         )
 
         except Exception as e:
-            print(f"  ⚠️  File monitoring error: {e}")
+            print(f"   File monitoring error: {e}")
 
         return detected
 
@@ -373,7 +373,7 @@ class EndpointDLPAgent:
 
             for device in new_devices:
                 self._stats["threats_detected"] += 1
-                print(f"\n  🔌 USB DEVICE CONNECTED: {device.get('name', 'Unknown')}")
+                print(f"\n  USB DEVICE CONNECTED: {device.get('name', 'Unknown')}")
 
                 self.db.add_scan_result(
                     scan_type="usb",
@@ -394,12 +394,12 @@ class EndpointDLPAgent:
             # Also check mounted volumes
             volumes = self.usb_monitor.get_mounted_volumes()
             for vol in volumes:
-                print(f"  💾 External volume: {vol['name']} at {vol['path']}")
+                print(f"  External volume: {vol['name']} at {vol['path']}")
 
             return bool(new_devices)
 
         except Exception as e:
-            print(f"  ⚠️  USB monitoring error: {e}")
+            print(f"   USB monitoring error: {e}")
             return False
 
     # ==================== NETWORK MONITORING ====================
@@ -415,7 +415,7 @@ class EndpointDLPAgent:
                 self._stats["threats_detected"] += 1
                 detected = True
 
-                print(f"\n  📡 NETWORK: {event.event_type} — {event.process} -> "
+                print(f"\n  NETWORK: {event.event_type} — {event.process} -> "
                       f"{event.domain or event.remote_addr}:{event.remote_port}")
                 print(f"     Risk: {event.risk_level.upper()}")
                 print(f"     {event.details}")
@@ -437,7 +437,7 @@ class EndpointDLPAgent:
                 )
 
         except Exception as e:
-            print(f"  ⚠️  Network monitoring error: {e}")
+            print(f"   Network monitoring error: {e}")
 
         return detected
 
@@ -450,14 +450,14 @@ class EndpointDLPAgent:
             self._stats["process_scans"] += 1
 
             # Check for new suspicious processes
-            new_procs = self.process_monitor.check_new_processes()
+            self.process_monitor.check_new_processes()
             suspicious = self.process_monitor.check_suspicious_processes()
 
             for proc in suspicious:
                 self._stats["threats_detected"] += 1
                 detected = True
 
-                print(f"\n  ⚙️  PROCESS: {proc['process']} (PID: {proc['pid']})")
+                print(f"\n   PROCESS: {proc['process']} (PID: {proc['pid']})")
                 print(f"     Risk: {proc['risk_level'].upper()}")
                 print(f"     {proc['reason']}")
 
@@ -477,7 +477,7 @@ class EndpointDLPAgent:
                 )
 
         except Exception as e:
-            print(f"  ⚠️  Process monitoring error: {e}")
+            print(f"   Process monitoring error: {e}")
 
         return detected
 
@@ -505,7 +505,7 @@ class EndpointDLPAgent:
                 )
 
                 if finding['severity'] in ('high', 'critical'):
-                    print(f"\n  🐚 SHELL: {finding['description']}")
+                    print(f"\n  SHELL: {finding['description']}")
                     print(f"     {finding['command'][:80]}")
 
                     self.send_event(
@@ -521,7 +521,7 @@ class EndpointDLPAgent:
             return bool(findings)
 
         except Exception as e:
-            print(f"  ⚠️  Shell history scan error: {e}")
+            print(f"   Shell history scan error: {e}")
             return False
 
     def scan_browser_history(self) -> bool:
@@ -554,12 +554,12 @@ class EndpointDLPAgent:
                 )
 
                 if entry.get('risk') == 'high':
-                    print(f"\n  🌐 BROWSER: Risky site access: {entry['url'][:60]}")
+                    print(f"\n  BROWSER: Risky site access: {entry['url'][:60]}")
 
             return bool(risky)
 
         except Exception as e:
-            print(f"  ⚠️  Browser history scan error: {e}")
+            print(f"   Browser history scan error: {e}")
             return False
 
     # ==================== MAIN MONITORING LOOP ====================
@@ -569,30 +569,30 @@ class EndpointDLPAgent:
 
         print(f"""
 ╔══════════════════════════════════════════════════════╗
-║  🛡️  TRON ENDPOINT DLP AGENT                     ║
+║   TRON ENDPOINT DLP AGENT                     ║
 ║  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━   ║
-║  📱 Device: {self.device_name:<40} ║
-║  👤 User:   {self.user:<40} ║
-║  🔗 API:    {self.api_url:<40} ║
-║  🆔 Session: {self.session_id:<39} ║
+║  Device: {self.device_name:<40} ║
+║  User:   {self.user:<40} ║
+║  API:    {self.api_url:<40} ║
+║  Session: {self.session_id:<39} ║
 ║  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━   ║
 ║  MONITORS:                                           ║
-║    ✅ Clipboard content scanning                     ║
-║    ✅ File content scanning (Downloads/Desktop)      ║
-║    ✅ USB device detection                           ║
-║    ✅ Network connection monitoring                  ║
-║    ✅ Process monitoring                             ║
-║    ✅ Shell history scanning                         ║
-║    ✅ Browser history scanning                       ║
+║    Clipboard content scanning                     ║
+║    File content scanning (Downloads/Desktop)      ║
+║    USB device detection                           ║
+║    Network connection monitoring                  ║
+║    Process monitoring                             ║
+║    Shell history scanning                         ║
+║    Browser history scanning                       ║
 ║  Status: MONITORING                                  ║
 ╚══════════════════════════════════════════════════════╝
         """)
 
         # Initial scans
-        print("📋 Running initial scans...")
+        print("Running initial scans...")
         self.scan_shell_history()
         self.scan_browser_history()
-        print("✅ Initial scans complete\n")
+        print("Initial scans complete\n")
 
         scan_count = 0
 
@@ -615,7 +615,7 @@ class EndpointDLPAgent:
 
                 timestamp = datetime.now().strftime('%H:%M:%S')
 
-                print(f"\n⏱️  Scan #{scan_count} at {timestamp}", end="")
+                print(f"\n Scan #{scan_count} at {timestamp}", end="")
 
                 # Core monitors (every scan)
                 self.monitor_clipboard()
@@ -642,8 +642,8 @@ class EndpointDLPAgent:
         except KeyboardInterrupt:
             pass
 
-        print(f"\n\n🛑 Agent stopped")
-        print(f"📊 Session stats: {json.dumps(self._stats, indent=2)}")
+        print("\n\nAgent stopped")
+        print(f"Session stats: {json.dumps(self._stats, indent=2)}")
 
 
 if __name__ == "__main__":

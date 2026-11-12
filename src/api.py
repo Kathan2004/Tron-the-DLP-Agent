@@ -14,14 +14,12 @@ import os
 import queue
 import re
 import secrets
-import tempfile
 import threading
 import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from config.settings import Config
 from flask import Flask, jsonify, request, send_file, g
 from flask_cors import CORS
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
@@ -36,7 +34,7 @@ from src.detection import get_engine as get_detection_engine, DETECTORS
 from src.detection import config as detector_config
 from src.detection.config import DetectorConfigStore
 from src.detection.engine import DetectionEngine
-from src.detection.idm import DocumentTooShort, IDMIndex
+from src.detection.idm import IDMIndex
 from src.detection.generators import DETECTOR_GENERATORS, GENERATORS, generate as generate_samples
 from src.detection.validators import VALIDATOR_INFO, VALIDATORS
 from src.file_scanner import configure_redaction
@@ -403,7 +401,7 @@ def _bootstrap_local_admin() -> None:
             is_active=True,
             must_change_password=generated,
         )
-        print(f"🔐 Local admin bootstrapped: {DEFAULT_ADMIN_EMAIL}")
+        print(f"Local admin bootstrapped: {DEFAULT_ADMIN_EMAIL}")
         if generated:
             # Shown exactly once, only on the console of the process that created the account.
             print("=" * 64)
@@ -412,7 +410,7 @@ def _bootstrap_local_admin() -> None:
             print("  You must change it on first login. It will not be shown again.")
             print("=" * 64)
     except Exception as e:
-        print(f"⚠️ Local admin bootstrap failed: {e}")
+        print(f"Local admin bootstrap failed: {e}")
 
 
 def _is_public_api_request(path: str, method: str) -> bool:
@@ -499,7 +497,10 @@ def _auth_guard():
         if identity is None:
             return jsonify({'error': 'agent_credentials_required'}), 401
         g.agent = identity
-        limited = security.check_rate('ingest', identity.agent_id or security.client_ip())
+        # Only a key-authenticated ID is trustworthy as a rate-limit identity; a claimed ID
+        # could be varied per request to dodge the limit.
+        limited = security.check_rate(
+            'ingest', identity.agent_id if identity.method == 'key' else security.client_ip())
         if limited is not None:
             return limited
         return None
@@ -2027,7 +2028,7 @@ def create_browser_incident():
             incident.ai_analysis = ai_analysis_dict
             incident.verdict = ai_analysis_dict["verdict"]
         
-        print(f"🚨 BROWSER INCIDENT: {incident.incident_id} - User {user} upload to {host} ({action})")
+        print(f"BROWSER INCIDENT: {incident.incident_id} - User {user} upload to {host} ({action})")
 
         # Broadcast real-time notification to SIEM Console
         try:
@@ -2041,7 +2042,7 @@ def create_browser_incident():
                 "action": action,
                 "risk": avg_risk,
                 "timestamp": datetime.now().isoformat(),
-                "message": f"🚨 {severity.upper()} — {user}@{host}: {pattern_desc[:80]}"
+                "message": f"{severity.upper()} — {user}@{host}: {pattern_desc[:80]}"
             })
         except Exception:
             pass
@@ -2062,9 +2063,9 @@ def create_browser_incident():
                         ),
                         loop
                     )
-                    print(f"📱 BROWSER TELEGRAM ALERT QUEUED: {incident.incident_id}")
+                    print(f"BROWSER TELEGRAM ALERT QUEUED: {incident.incident_id}")
         except Exception as e:
-            print(f"⚠️ Telegram alert failed for browser incident: {scrub_token(e)}")
+            print(f"Telegram alert failed for browser incident: {scrub_token(e)}")
 
         return jsonify({
             "status": "success",
@@ -2133,7 +2134,7 @@ def analyze_incident(incident_id):
                         loop
                     )
         except Exception as e:
-            print(f"⚠️ Telegram send failed: {scrub_token(e)}")
+            print(f"Telegram send failed: {scrub_token(e)}")
 
         return jsonify(analysis), 200
 
@@ -2566,7 +2567,7 @@ def bulk_incident_action():
                 closed_at=datetime.now().isoformat(),
             )
             updated.append({"incident_id": incident_id, "status": "closed", "classification": classification})
-        except Exception as e:
+        except Exception:
             log.exception("bulk action failed for %s", incident_id)
             failed.append({"incident_id": incident_id, "error": "action_failed"})
 
@@ -2997,7 +2998,7 @@ def scan_browser_file_payload():
             "finding_count": len(findings),
             "findings": findings,
         }), 200
-    except Exception as e:
+    except Exception:
         log.exception("browser file scan failed")
         return jsonify({"inspected": False, "findings": [], "error": "scan_failed"}), 200
 

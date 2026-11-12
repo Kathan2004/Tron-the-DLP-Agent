@@ -8,31 +8,28 @@ Open-source endpoint and web data loss prevention: agents and a Chrome extension
 [![Python 3.11](https://img.shields.io/badge/python-3.11-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![React 19](https://img.shields.io/badge/react-19-61DAFB.svg?logo=react&logoColor=black)](https://react.dev/)
 
-> **Status:** active development. Open-source endpoint and web DLP platform; contributions welcome. Before deploying in production, review the [Roadmap](#roadmap) (TLS and production WSGI, per-agent keys for ingest endpoints) and the [Security notes](#security-notes).
+> **Status:** 2.1. Runs in production form (gunicorn, TLS reverse proxy, per-agent keys, encryption at rest). Read [docs/security.md](docs/security.md) for the trust model and its stated limitations before deploying.
 
 ## What it does
 
-**Endpoint agents** (`agents/`, Python, macOS/Linux)
+**Endpoint agents** (`agents/`, Python; macOS, Linux, Windows)
 - `endpoint_agent.py`: clipboard scanning, file-upload/watch-folder scanning, USB device detection, network connection and suspicious-process monitoring, shell and browser history scanning
 - `network_agent.py`: outbound connections, outbound data volume, listening ports, browser activity
 - `web_agent.py`: downloads, browser history, print spool and temp-file scanning
-
-All agents check in to the API (fleet heartbeat) and post events to `/api/events`.
+- All agents enroll once, authenticate with their own key, spool detections to an encrypted local queue while the API is unreachable, and accept signed upgrades
 
 **Chrome extension** (`browser-extension/`, Manifest V3)
 - Inspects web **pastes** and **file uploads** (file picker and drag-and-drop) before they reach the page
-- Local regex scanning, with block / warn / monitor modes and policy sync from the API
-- Reports incidents and blocked artifacts to the API
+- Local scanning with the same detector library, block / warn / monitor modes, policy sync from the API
+- Holds its agent key in the service worker; content scripts never see credentials
 
-**SIEM console** (`siem-console/`, React + Vite)
-- Detector library: enable, tune or reset any built-in detector and create custom ones (pattern + checksum validator + keyword context)
-- Detection Lab: plain-language rule builder, explainable testing, checksum checker and test data generator
-- Dashboard with live event stream
-- Fleet view (endpoint status, commands, collected artifacts, managed extension settings per agent)
-- Policies and exceptions
-- Governance (audit trail, users, roles and IAM settings)
-- Analytics
-- Events log with event and incident drill-down
+**Console** (`siem-console/`, React + Vite)
+- Dashboard with live event stream, analytics, events log with event and incident drill-down
+- Policies, exceptions, detector library (tune built-ins, add custom detectors), Detection Lab
+- Protected Documents: register confidential documents for fingerprint matching
+- Fleet view (status, commands, collected artifacts, managed extension settings)
+- Platform & Security: security posture, agent key inventory (issue, rotate, revoke), data retention, SIEM forwarding
+- Governance: hash-chained audit trail, users, roles, per-permission RBAC
 
 ## Detection pipeline
 
@@ -46,9 +43,10 @@ content ──► true file type ──► extraction / OCR ──► normalize 
 1. **True type and extraction** (`src/extraction.py`): magic bytes pick the parser, so renamed files are still inspected. PDF text via PDFium, with page-level OCR only for scanned pages; Office/OpenDocument including headers, footers, comments, notes and numeric cells; archives and email attachments recursively with zip-bomb limits; encrypted files reported explicitly.
 2. **Detection** (`src/detection/`): 53 data identifiers with 20 validators (Luhn + issuer ranges, Verhoeff, ISO 7064 mod 97-10 and mod 11-2, SSN rules, ABA, NHS, CPF, DNI, TFN, GSTIN, JWT), keyword proximity, Unicode/zero-width/base64 evasion handling, and overlap resolution so one value yields one finding. 20 of them cover credentials (GitHub, GitLab, Slack, Stripe, Google, Azure, OpenAI, Anthropic, private keys, credentialed connection strings, entropy-checked generic secrets).
 3. **Exact Data Match**: optional hashed index of protected records (for example the customer table); a match needs several fields of the same record, not just something that looks like an SSN.
+   **Indexed Document Matching** (`src/detection/idm.py`): register confidential documents in the console; winnowed, keyed shingle fingerprints then detect full copies, reformatted copies and excerpts of about 13 words or more. Only fingerprints are stored.
 4. **Policies**: console policies are either custom regexes or references to validated built-in detectors. Files with 10+ identity/financial findings escalate to critical (bulk exposure).
 5. **Redaction and LLM triage** (Gemini): every detected value is replaced with `[REDACTED:<TYPE>]` before the prompt is built. The model returns a false-positive probability, risk score and verdict; without an API key the system falls back to "needs review".
-6. **Incidents and alerting**: events are correlated per policy threshold and window, stored in SQLite, streamed to the console and sent to Telegram (with inline actions). Slack and Jira escalation are optional.
+6. **Incidents and alerting**: events are correlated per policy threshold and window, stored in SQLite (sensitive columns encrypted), streamed to the console, and forwarded to your SIEM (syslog CEF/JSON, HTTPS webhooks, Splunk HEC). Telegram alerts, Slack and Jira escalation are optional.
 
 The browser extension runs the same detector library (generated from the Python source and parity-tested in CI).
 
@@ -67,153 +65,160 @@ The browser extension runs the same detector library (generated from the Python 
 ```mermaid
 flowchart LR
     subgraph Endpoints
-        EA[Endpoint agent]
-        NA[Network agent]
-        WA[Web agent]
+        EA[Endpoint / network / web agents]
         EXT[Chrome extension]
     end
 
-    subgraph Server["Tron API (Flask)"]
-        API[REST API<br/>auth + RBAC]
-        RE[Rules engine<br/>policies + validated detectors]
-        FS[Extraction + detection<br/>true type, OCR, EDM]
-        RED[Redaction]
+    subgraph Server
+        RP[Reverse proxy<br/>TLS]
+        CON[Console<br/>nginx, static]
+        API[API<br/>gunicorn, auth + RBAC + rate limits]
+        DET[Extraction + detection<br/>detectors, EDM, IDM]
         EP[Event processor<br/>incident correlation]
+        DB[(SQLite<br/>AES-GCM sealed columns)]
+        ART[(Artifact store<br/>encrypted)]
+        OUT[SIEM outbox]
     end
 
-    DB[(SQLite)]
-    CON[SIEM console<br/>React + Vite]
-    LLM[LLM triage<br/>Gemini]
-    TG[Telegram alerts]
-    ESC[Slack / Jira<br/>optional]
+    SIEM[SIEM<br/>syslog / HTTPS]
+    LLM[LLM triage<br/>redacted input]
+    ALERT[Telegram / Slack / Jira]
 
-    EA & NA & WA -- events, check-ins --> API
-    EXT -- incidents, artifacts, policy sync --> API
-    API --> RE --> EP
-    API --> FS --> EP
-    EP --> DB
-    EP --> RED --> LLM
-    EP --> TG
-    EP --> ESC
-    CON -- signed bearer token --> API
-    API --> DB
+    EA & EXT -- per-agent key --> RP
+    RP --> CON --> API
+    API --> DET --> EP --> DB
+    API --> ART
+    EP --> OUT --> SIEM
+    EP --> LLM
+    EP --> ALERT
 ```
 
 ## Quick start
 
-### Option A: local (`setup.sh`)
+### Docker Compose (console + API)
 
 ```bash
 git clone https://github.com/Kathan2004/Tron-the-DLP-Agent.git
 cd Tron-the-DLP-Agent
-./setup.sh                 # creates venv/, installs requirements, copies .env.example -> .env
-$EDITOR .env               # fill in the variables below
-./start                    # API on :5001 + console on :5173
-# or
-./start_all.sh             # API + endpoint, network and web agents
+./setup.sh                      # creates .env with generated secrets
+docker compose up -d --build    # http://127.0.0.1:8080
+docker compose logs tron-api | grep -A3 "one-time admin password"
+```
+
+With TLS: `TRON_DOMAIN=dlp.example.com TRON_TRUSTED_PROXIES=2 docker compose --profile tls up -d --build`. Details, backup and monitoring: [docs/deployment.md](docs/deployment.md).
+
+### Local development
+
+```bash
+./setup.sh
+./start            # API on 127.0.0.1:5001 (dev server) + console on localhost:5173
+./start_all.sh     # API + endpoint, network and web agents
 ```
 
 OCR needs the Tesseract binary (`brew install tesseract` or `apt install tesseract-ocr`). Without it, images and scanned PDFs are reported as not inspected; everything else works.
 
-Open the console at http://localhost:5173. On first start, if `APP_ADMIN_PASSWORD` is not set, the API prints a one-time admin password and forces a change at first login.
+On first start, if `APP_ADMIN_PASSWORD` is not set, the API prints a one-time admin password and forces a change at first login.
 
-### Option B: Docker Compose (API only)
+### Agents
 
 ```bash
-cp .env.example .env && $EDITOR .env
-mkdir -p config && cp /path/to/service-account.json config/service-account.json
-docker compose up -d --build
-curl http://localhost:5001/api/health
+export TRON_AGENT_TOKEN=<enrollment token from the API's .env>
+python agents/endpoint_agent.py --api https://dlp.example.com
 ```
 
-Run the console separately with `cd siem-console && npm install && npm run dev`.
+The agent enrolls on first contact and keeps its key in `~/.tron/` (`%LOCALAPPDATA%\Tron\` on Windows). Plain `http://` is only accepted for loopback.
 
-### Environment variables
+### Chrome extension
+
+1. `chrome://extensions` > enable **Developer mode** > **Load unpacked** > select `browser-extension/` (or use the zip attached to a GitHub Release).
+2. For managed fleets, push `apiUrl` and `agentToken` through Chrome enterprise policy (schema: `browser-extension/managed_schema.json`). Policy values override local settings.
+
+### Configuration
 
 | Variable | Required | Description |
 |---|---|---|
-| `APP_AUTH_SECRET` | Recommended | Signs console auth tokens. If unset, a random per-run secret is used and sessions end on restart. |
-| `APP_ADMIN_EMAIL` | No | Bootstrap admin email (default `admin@tron.local`). |
-| `APP_ADMIN_PASSWORD` | No | Bootstrap admin password. If unset, a random one is generated, printed once, and must be changed on first login. |
-| `APP_CORS_ORIGINS` | No | Comma-separated console origins allowed to call the API (default `http://localhost:5173,http://127.0.0.1:5173`). |
-| `TELEGRAM_BOT_TOKEN` | Yes | Telegram bot token for alerts. |
-| `SECURITY_CHAT_ID` | Yes (for alerts) | Telegram chat that receives alerts (`/getchatid` in the bot prints it). |
-| `GCP_PROJECT_ID` | Yes | Google Cloud project ID. |
-| `GCP_CREDENTIALS_PATH` | No | Service account key path (default `./config/service-account.json`). |
-| `GOOGLE_GENAI_API_KEY` | No | Gemini API key for LLM triage and the AI rule lab. |
-| `FLASK_HOST` / `FLASK_PORT` | No | API bind address (default `0.0.0.0:5000`; `.env.example` and the scripts use `127.0.0.1:5001`). |
-| `SLACK_WEBHOOK_URL` | No | Slack escalation. |
-| `JIRA_SERVER` / `JIRA_USER` / `JIRA_TOKEN` | No | Jira ticket creation on escalation. |
-| `NGROK_DOMAIN` | No | `./start` only: expose the API through an ngrok reserved domain. |
-| `VITE_API_BASE` | No | Console build-time API base URL (default `http://127.0.0.1:5001/api`). |
-| `APP_MAX_REQUEST_MB` | No | Maximum request body size (default 75 MB, enough for a base64-encoded 50 MB file). |
+| `APP_AUTH_SECRET` | Yes | Signs console sessions and stream tickets. If unset, a random per-run secret is used and sessions end on restart. |
+| `TRON_AGENT_TOKEN` | Yes | Enrollment token. Agents and the extension exchange it once for their own key. If unset, ingest endpoints are unauthenticated. |
+| `TRON_AGENT_AUTH` | Recommended | `strict` once agents are enrolled: only per-agent keys are accepted on ingest. Default `token` (shared token or key). |
+| `TRON_DATA_KEY` | Recommended | Base64 32-byte key for encryption at rest. If unset, a key file is created next to the database. |
+| `TRON_TRUSTED_PROXIES` | Behind a proxy | Number of proxy hops whose `X-Forwarded-*` headers are trusted (default 0). |
+| `APP_ADMIN_EMAIL` / `APP_ADMIN_PASSWORD` | No | Bootstrap admin (only while the user table is empty). |
+| `APP_CORS_ORIGINS` | No | Console origins allowed cross-origin. Not needed when console and API share an origin. |
+| `TRON_METRICS_TOKEN` | No | Enables `GET /api/metrics` (Prometheus) with this bearer token. |
+| `TRON_LOG_FORMAT` / `TRON_LOG_LEVEL` | No | `json` for structured logs; level (default `INFO`). |
+| `TRON_UPDATE_PUBKEY` | Agents | Base64 Ed25519 public key for verifying signed upgrades. If unset, the agent refuses remote upgrades. |
+| `TELEGRAM_BOT_TOKEN` / `SECURITY_CHAT_ID` | No | Telegram alerts with inline actions. |
+| `GOOGLE_GENAI_API_KEY` | No | Gemini LLM triage and the AI rule lab (input is redacted first). |
+| `SLACK_WEBHOOK_URL`, `JIRA_SERVER` / `JIRA_USER` / `JIRA_TOKEN` | No | Escalation. |
+| `APP_MAX_REQUEST_MB` | No | Maximum request body size (default 75 MB). |
 | `TRON_BULK_THRESHOLD` | No | Identity/financial findings in one file that escalate it to critical (default 10). |
-| `TRON_AGENT_TOKEN` | Recommended | Enrollment token. When set, ingest endpoints (`/api/events`, `/api/fleet/*`, `/api/browser/*`, `/api/scan/*`, `/api/screenshots`, `/api/policies/sync`) require it in `X-Tron-Agent-Token`. Python agents read it from the same variable; the extension reads `agentToken` from enterprise policy. |
-| `TRON_UPDATE_PUBKEY` | Agents only | Base64 Ed25519 public key for verifying signed upgrades. If unset, the agent refuses remote upgrades. |
-| `TRON_EDM_DIR` / `TRON_EDM_KEY` | No | Exact Data Match index directory (default `data/edm`) and HMAC key (default: `data/edm/.key`, created on first build). |
+| `TRON_EDM_DIR` / `TRON_EDM_KEY` | No | Exact Data Match index directory and HMAC key. |
 
-### Load the Chrome extension
+SIEM destinations and retention periods are configured in the console, not in the environment. Rate limits and the remaining knobs are listed in [docs/deployment.md](docs/deployment.md).
 
-1. Open `chrome://extensions` and enable **Developer mode**.
-2. Click **Load unpacked** and select the `browser-extension/` folder.
-3. The extension reports to `http://localhost:5001` by default (`apiUrl` in `browser-extension/background.js`).
-4. For managed fleets, push `apiUrl` and `agentToken` through Chrome enterprise policy (schema: `browser-extension/managed_schema.json`). Policy values override local settings.
+## Security
 
-## Security notes
+The full model is in [docs/security.md](docs/security.md). In short:
 
-- **Redaction before any external LLM call.** Server-side triage and rule generation pass all text through `redact_for_llm`, which runs the full detector library with keyword requirements ignored (over-redaction is the safe failure); the extension masks detector matches in file text and findings before calling Gemini. Limitation: when the extension's optional AI mode is enabled with a Gemini key, **image** uploads are sent to Gemini unredacted for OCR.
-- **Local storage keeps matched values.** Findings in the local SQLite database include the matched text so analysts can review them. Protect the `data/` directory accordingly.
-- **Auth model.** Console users authenticate with email and password (PBKDF2-SHA256, 200k iterations). Successful login creates a server-side session and returns a signed, time-limited bearer token (`itsdangerous`, default TTL 8h). Every request re-checks the session: revocation, expiry, idle timeout (default 120 min), and a cap on concurrent sessions. Repeated failed logins lock the account. Roles: `SUPER_ADMIN`, `SECURITY_ADMIN`, `SOC_ANALYST`, `VIEWER`, with per-permission RBAC and custom roles. Accounts flagged for a password change can only use self-service auth endpoints until they change it.
-- **Signed agent upgrades.** `POST /api/fleet/agents/<id>/upgrade` only accepts an `https` installer URL, its SHA-256 and an Ed25519 signature. Agents download the installer, verify the hash and the signature against the locally pinned `TRON_UPDATE_PUBKEY`, and only then execute it with a fixed argv (no shell). A compromised or impersonated API server cannot run code on endpoints. Sign releases with `scripts/sign_agent_update.py`.
-- **Agent enrollment token.** With `TRON_AGENT_TOKEN` set, unauthenticated callers can no longer inject events, spoof check-ins or poison the incident queue. The API warns at startup when it is unset.
-- **Server-side scans require a session.** `/api/scan/file` (reads paths on the API host) and `/api/scan/clipboard` require console authentication; request bodies are capped by `APP_MAX_REQUEST_MB`.
-- **CORS.** Console APIs only accept the origins in `APP_CORS_ORIGINS`. The unauthenticated ingest endpoints used by the extension's content script (`/api/browser/*`, `/api/scan/*`) accept any origin.
-- **No real data is committed.** Databases, captured artifacts, logs, `.env` and service account keys are git-ignored. `.env.example` contains placeholders only.
+- **Agents authenticate individually.** Enrollment issues a per-agent key (only its hash is stored); keys rotate and revoke from the console; a key binds every request to its agent, so one agent cannot report as another.
+- **Sensitive data is encrypted at rest** with AES-256-GCM: matched values, payload samples, captured files, screenshots, the SIEM queue and stored integration secrets.
+- **Nothing sensitive leaves unredacted.** LLM prompts are built from redacted text; SIEM records carry detector names and identities, never matched values. (Exception: the extension's optional AI mode sends image uploads to Gemini for OCR.)
+- **The audit log is tamper-evident** (hash chain, verifiable from the console).
+- **Console access** uses server-side sessions with revocation, idle timeout, lockout, per-permission RBAC and a rate-limited login. The live stream requires a short-lived ticket.
+- **Signed agent upgrades** (Ed25519, key pinned on the agent): a compromised API cannot run code on endpoints.
+- **Hardened HTTP surface:** security headers and CSP, opaque errors with request IDs, captured files never rendered as active content, request size caps.
+- **No real data is committed.** Databases, artifacts, logs, `.env` and keys are git-ignored.
 
 ## Tests
 
 ```bash
 pip install -r requirements-dev.txt
 python -m pytest -q                       # OCR tests skip if tesseract is missing
+ruff check . && pip-audit -r requirements.txt
 python scripts/benchmark_detection.py     # precision/recall + latency
+cd siem-console && npm ci && npm run lint && npm run build
 ```
 
-CI (`.github/workflows/ci.yml`) runs the tests, the benchmark, the extension parity check, the console build, a manifest check and a gitleaks history scan on every push. Actions are pinned to commit SHAs.
+CI (`.github/workflows/ci.yml`) runs lint, dependency audits (pip and npm), the tests, the benchmark, the extension parity check, the console build, both image builds with a container health check, a manifest check and a gitleaks history scan. Actions are pinned to commit SHAs. Tagging `vX.Y.Z` publishes the extension zip with checksums as a GitHub Release.
 
-## Screenshots
+## Documentation
 
-Screenshots will live in [`docs/screenshots/`](docs/screenshots/).
+- [docs/deployment.md](docs/deployment.md): topology, TLS, process model, agent key rollout, backup, monitoring
+- [docs/security.md](docs/security.md): trust boundaries, encryption, audit chain, limitations
+- [docs/api.md](docs/api.md): agent, IDM and platform endpoints
+- [docs/detection.md](docs/detection.md): detection design, benchmarks, gap analysis
 
 ## Roadmap
 
-- [ ] Production WSGI server and TLS guidance
-- [x] Shared enrollment token for ingest endpoints (`TRON_AGENT_TOKEN`)
-- [ ] Per-agent keys with rotation
-- [x] Signed agent upgrades (Ed25519, pinned key)
-- [ ] Windows endpoint agent
-- [ ] Encrypted-at-rest findings and artifact retention policies
-- [ ] Indexed Document Matching (fingerprints of specific protected documents)
-- [x] Validated detectors, keyword context, evasion handling, Exact Data Match
-- [x] Lightweight extraction (Docling removed), archives, encrypted-file detection
-- [x] Automated tests and CI
-- [ ] Published extension build as a GitHub Release asset
+- [x] Production WSGI server and TLS deployment
+- [x] Per-agent keys with rotation and revocation
+- [x] Windows endpoint agent (parser-tested; not yet exercised on a Windows host in CI)
+- [x] Encryption at rest and retention policies
+- [x] Indexed Document Matching
+- [x] SIEM forwarding (syslog CEF/JSON, webhooks, Splunk HEC)
+- [x] Extension build published as a GitHub Release asset
+- [ ] Client/server database option for multi-process scale-out
+- [ ] SSO (OIDC/SAML) and MFA for the console
+- [ ] HttpOnly cookie sessions for the console
+- [ ] Signed upgrades for Windows agents; agent packaging as OS services
+- [ ] Email (SMTP/MTA) and cloud-storage API channels
 
 ## Project layout
 
 ```
 agents/             endpoint, network and web agents
 browser-extension/  Chrome MV3 extension
-config/             settings (service-account.json goes here, git-ignored)
-siem-console/       React/Vite admin console
-src/                Flask API, rules engine, scanners, Telegram bot, database
-src/detection/      detector library, validators, engine, Exact Data Match
-src/extraction.py   true-type detection, PDF/Office/archive/email extraction, OCR
-scripts/            benchmark, extension detector generator
-tests/              pytest suite (detection, extraction, rules engine, API, extension parity)
-docs/               detection design, benchmarks, gap analysis
-main.py             API entry point
-start / stop        API + console (+ optional ngrok)
-start_all.sh / stop_all.sh   API + all agents
+config/             settings
+deploy/             Caddyfile for the TLS profile
+docs/               deployment, security, API, detection design
+siem-console/       React/Vite console, nginx config, Dockerfile
+src/                API (api.py, routes_platform.py), bootstrap, security, crypto, agent auth,
+                    SIEM forwarder, retention, metrics, database, scanners, Telegram bot
+src/detection/      detector library, validators, engine, Exact Data Match, document matching
+scripts/            benchmark, extension detector generator, upgrade signing
+tests/              pytest suite
+wsgi.py             production entry point (gunicorn -c gunicorn.conf.py wsgi:app)
+main.py             development entry point
 ```
 
 ## Author
