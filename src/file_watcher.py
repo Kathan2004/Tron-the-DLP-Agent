@@ -31,6 +31,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.file_scanner import FileContentScanner, SCANNABLE_TEXT_EXTENSIONS
 
 
+from src import platform_support  # noqa: E402
+
+
+def _watcher_client(api_url: str, host: str, user: str):
+    from src.agent_client import AgentClient, safe_agent_id
+    return AgentClient(api_url, safe_agent_id("file-watcher", host, user), "file_watcher", host)
+
+
 class DLPFileEventHandler(FileSystemEventHandler):
     """Handle filesystem events and scan for sensitive data."""
 
@@ -40,8 +48,9 @@ class DLPFileEventHandler(FileSystemEventHandler):
         self.scanner = scanner
         self.api_url = api_url
         self.db = db
-        self.user = user or os.getenv("USER", "unknown")
-        self.host = host or os.getenv("HOSTNAME", "unknown")
+        self.user = user or platform_support.username()
+        self.host = host or platform_support.hostname()
+        self.client = _watcher_client(api_url, self.host, self.user)
         self._recent_events: Dict[str, float] = {}  # Debouncing
         self._lock = threading.Lock()
         self._alert_count = 0
@@ -157,17 +166,13 @@ class DLPFileEventHandler(FileSystemEventHandler):
                 }
             }
 
-            response = requests.post(
-                f"{self.api_url}/api/events",
-                json=payload,
-                timeout=5
-            )
+            response = self.client.post("/api/events", payload, spool=True)
 
-            if response.status_code == 200:
+            if response is not None and response.status_code == 200:
                 event_id = response.json().get("event_id")
                 print(f"   OK: Alert sent: {event_id}")
             else:
-                print(f"   API error: {response.status_code}")
+                print("   API unavailable; alert spooled for retry")
 
         except Exception as e:
             print(f"   Warning: Cannot reach API: {e}")
@@ -193,6 +198,9 @@ class USBMonitor:
         """Get currently connected USB devices."""
         devices = []
         try:
+            native = platform_support.usb_devices()
+            if native is not None:
+                return native
             if self.platform == "darwin":
                 import subprocess
                 result = subprocess.run(
@@ -287,28 +295,11 @@ class USBMonitor:
 
     def get_mounted_volumes(self) -> List[Dict]:
         """Get mounted external volumes."""
-        volumes = []
         try:
-            if sys.platform == "darwin":
-                volumes_path = Path("/Volumes")
-                if volumes_path.exists():
-                    for vol in volumes_path.iterdir():
-                        if vol.name == "Macintosh HD":
-                            continue
-                        if vol.is_dir() or vol.is_mount():
-                            try:
-                                stat = vol.stat()
-                                volumes.append({
-                                    "name": vol.name,
-                                    "path": str(vol),
-                                    "type": "external",
-                                })
-                            except OSError:
-                                pass
+            return platform_support.removable_volumes()
         except Exception as e:
             print(f"Warning: Volume scan error: {e}")
-
-        return volumes
+            return []
 
 
 class RealTimeWatcher:
@@ -319,8 +310,9 @@ class RealTimeWatcher:
         self.api_url = api_url
         self.db = db
         self.scanner = FileContentScanner()
-        self.user = os.getenv("USER", "unknown")
-        self.host = os.getenv("HOSTNAME", "unknown")
+        self.user = platform_support.username()
+        self.host = platform_support.hostname()
+        self.client = _watcher_client(api_url, self.host, self.user)
         self.usb_monitor = USBMonitor()
 
         # Default directories to watch
@@ -406,13 +398,9 @@ class RealTimeWatcher:
                 }
             }
 
-            response = requests.post(
-                f"{self.api_url}/api/events",
-                json=payload,
-                timeout=5
-            )
+            response = self.client.post("/api/events", payload, spool=True)
 
-            if response.status_code == 200:
+            if response is not None and response.status_code == 200:
                 print(f"\n  USB alert sent: {device.get('name')}")
 
         except Exception as e:

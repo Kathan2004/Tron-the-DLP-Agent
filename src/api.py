@@ -53,19 +53,16 @@ security.install(app)
 # Hard cap on request bodies (base64 of a 50 MB file is ~67 MB).
 app.config['MAX_CONTENT_LENGTH'] = int(os.getenv('APP_MAX_REQUEST_MB', '75')) * 1024 * 1024
 
-# Console API: only the configured console origins may call it cross-origin.
-# Unauthenticated ingest endpoints used by the browser extension's content script
-# (which runs under the visited page's origin) stay open to any origin.
+# Only the configured console origins may call the API cross-origin. Agents and the browser
+# extension's service worker are not subject to CORS; content scripts never call the API
+# directly (they relay through the service worker, which holds the agent key).
 CORS_ALLOWED_ORIGINS = [
     o.strip() for o in os.getenv(
         'APP_CORS_ORIGINS', 'http://localhost:5173,http://127.0.0.1:5173'
-    ).split(',') if o.strip()
+    ).split(',') if o.strip() and o.strip() != '*'
 ]
-CORS(app, resources={
-    r"/api/browser/.*": {"origins": "*"},
-    r"/api/scan/.*": {"origins": "*"},
-    r"/api/.*": {"origins": CORS_ALLOWED_ORIGINS},
-})
+CORS(app, resources={r"/api/.*": {"origins": CORS_ALLOWED_ORIGINS}},
+     allow_headers=["Authorization", "Content-Type", "X-Request-ID"], max_age=600)
 
 # These will be initialized in main.py
 incident_store: IncidentStore | None = None

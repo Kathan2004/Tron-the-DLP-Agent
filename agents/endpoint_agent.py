@@ -27,7 +27,9 @@ from typing import List, Dict, Optional, Any
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.agent_updates import UpgradeRejected, agent_headers, apply_upgrade
+from src import platform_support
+from src.agent_client import AgentClient, safe_agent_id
+from src.agent_updates import UpgradeRejected, apply_upgrade
 from src.file_scanner import FileContentScanner
 from src.detection.config import DetectorConfigStore
 from src.network_monitor import NetworkMonitor, ProcessMonitor, ShellHistoryScanner, BrowserHistoryScanner
@@ -40,9 +42,11 @@ class EndpointDLPAgent:
 
     def __init__(self, api_url="http://localhost:5001", device_name=None):
         self.api_url = api_url
-        self.device_name = device_name or os.getenv("HOSTNAME", os.uname().nodename)
-        self.user = os.getenv("USER", "unknown")
+        self.device_name = device_name or platform_support.hostname()
+        self.user = platform_support.username()
         self.agent_type = "endpoint_agent"
+        self.client = AgentClient(self.api_url, safe_agent_id("endpoint-agent", self.device_name, self.user),
+                                  self.agent_type, self.device_name)
         self.session_id = hashlib.md5(f"{self.device_name}-{time.time()}".encode()).hexdigest()[:8]
         self.active_policies = []
 
@@ -75,6 +79,8 @@ class EndpointDLPAgent:
 
     def _handle_server_command(self, command: Optional[dict]):
         """Handle server-issued control commands. Only signed upgrades are accepted."""
+        if self.client.handle_command(command):
+            return
         if not isinstance(command, dict) or command.get('type') != 'upgrade':
             return
         try:
@@ -96,20 +102,15 @@ class EndpointDLPAgent:
                 "geo": metadata or {}
             }
 
-            response = requests.post(
-                f"{self.api_url}/api/events",
-                json=event_data,
-                timeout=5,
-                headers=agent_headers(),
-            )
+            response = self.client.post("/api/events", event_data, spool=True)
 
-            if response.status_code == 200:
+            if response is not None and response.status_code == 200:
                 result = response.json()
                 self._stats["events_sent"] += 1
                 print(f"  ✅ Event sent: {result.get('event_id')} | Channel: {channel}")
                 return True
             else:
-                print(f"  ❌ API error: {response.status_code}")
+                print(f"  API unavailable ({response.status_code if response is not None else 'unreachable'}); event spooled for retry")
                 return False
 
         except requests.exceptions.ConnectionError:
@@ -122,8 +123,8 @@ class EndpointDLPAgent:
     def sync_policies(self):
         """Sync active policies from API."""
         try:
-            response = requests.get(f"{self.api_url}/api/policies/sync", timeout=5, headers=agent_headers())
-            if response.status_code == 200:
+            response = self.client.get("/api/policies/sync", params={"agent_id": self.client.agent_id})
+            if response is not None and response.status_code == 200:
                 data = response.json()
                 self.active_policies = data.get('patterns', [])
         except Exception:
@@ -174,10 +175,10 @@ class EndpointDLPAgent:
         """Register agent with fleet management."""
         try:
             payload = {
-                "agent_id": f"endpoint-agent-{self.device_name}-{self.user}",
+                "agent_id": self.client.agent_id,
                 "agent_type": self.agent_type,
                 "hostname": self.device_name,
-                "os": sys.platform,
+                "os": platform_support.os_label(),
                 "user": self.user,
                 "version": self.agent_version,
                 "scans_reported": self._stats["file_scans"] + self._stats["clipboard_scans"],
@@ -189,8 +190,8 @@ class EndpointDLPAgent:
                     "screens_scanned": self._stats.get("process_scans", 0)
                 }
             }
-            res = requests.post(f"{self.api_url}/api/fleet/checkin", json=payload, timeout=5, headers=agent_headers())
-            if res.ok:
+            res = self.client.post("/api/fleet/checkin", payload)
+            if res is not None and res.ok:
                 body = res.json() if res.content else {}
                 cmd = body.get('command') if isinstance(body, dict) else None
                 self._handle_server_command(cmd if isinstance(cmd, dict) else None)
@@ -211,19 +212,7 @@ class EndpointDLPAgent:
     def monitor_clipboard(self) -> bool:
         """Monitor clipboard for sensitive data — scans actual content."""
         try:
-            if sys.platform == "darwin":
-                result = subprocess.run(
-                    ["pbpaste"], capture_output=True, text=True, timeout=2
-                )
-                clipboard_content = result.stdout
-            elif sys.platform == "linux":
-                result = subprocess.run(
-                    ["xclip", "-selection", "clipboard", "-o"],
-                    capture_output=True, text=True, timeout=2
-                )
-                clipboard_content = result.stdout
-            else:
-                return False
+            clipboard_content = platform_support.read_clipboard()
 
             if not clipboard_content or len(clipboard_content) < 4:
                 return False
@@ -286,8 +275,8 @@ class EndpointDLPAgent:
 
         try:
             dirs_to_scan = [
-                watch_dir or os.path.expanduser("~/Downloads"),
-                os.path.expanduser("~/Desktop"),
+                watch_dir or str(Path.home() / "Downloads"),
+                str(Path.home() / "Desktop"),
             ]
 
             for scan_dir in dirs_to_scan:

@@ -67,6 +67,9 @@ PERSONAL_EMAIL_DOMAINS = {
 }
 
 
+from src import platform_support  # noqa: E402
+
+
 @dataclass
 class NetworkEvent:
     """A detected network event."""
@@ -92,7 +95,7 @@ class NetworkMonitor:
     def __init__(self):
         self.platform = sys.platform
         self.hostname = socket.gethostname()
-        self.user = os.getenv("USER", "unknown")
+        self.user = platform_support.username()
         self._seen_connections: Set[str] = set()
         self._dns_cache: Dict[str, str] = {}
 
@@ -116,6 +119,9 @@ class NetworkMonitor:
                     capture_output=True, text=True, timeout=10
                 )
                 connections = self._parse_ss(result.stdout)
+
+            elif platform_support.IS_WINDOWS:
+                connections = platform_support.windows_connections()
 
         except subprocess.TimeoutExpired:
             print("⚠️  Network scan timed out")
@@ -369,7 +375,7 @@ class NetworkMonitor:
             connections.append({
                 "process": process,
                 "pid": pid,
-                "user": os.getenv("USER", "unknown"),
+                "user": platform_support.username(),
                 "local_addr": local,
                 "remote_addr": remote_addr,
                 "remote_port": remote_port,
@@ -407,13 +413,15 @@ class ProcessMonitor:
 
     def __init__(self):
         self.platform = sys.platform
-        self.user = os.getenv("USER", "unknown")
+        self.user = platform_support.username()
         self._known_pids: Set[int] = set()
 
     def get_running_processes(self) -> List[Dict]:
         """Get list of running processes."""
         processes = []
         try:
+            if platform_support.IS_WINDOWS:
+                return platform_support.windows_processes()
             if self.platform == "darwin":
                 result = subprocess.run(
                     ["ps", "aux"],
@@ -540,15 +548,10 @@ class BrowserHistoryScanner:
         history = []
 
         try:
-            if self.platform == "darwin":
-                history_path = Path.home() / "Library/Application Support/Google/Chrome/Default/History"
-            elif self.platform == "linux":
-                history_path = Path.home() / ".config/google-chrome/Default/History"
-            else:
+            candidates = platform_support.chromium_history_files()
+            if not candidates:
                 return []
-
-            if not history_path.exists():
-                return []
+            history_path = candidates[0]
 
             # Copy the file since Chrome locks it
             import shutil
@@ -681,11 +684,7 @@ class ShellHistoryScanner:
     def scan_shell_history(self) -> List[Dict]:
         """Scan shell history files for suspicious commands."""
         findings = []
-        history_files = [
-            Path.home() / ".bash_history",
-            Path.home() / ".zsh_history",
-            Path.home() / ".local/share/fish/fish_history",
-        ]
+        history_files = platform_support.shell_history_files()
 
         for hist_file in history_files:
             if not hist_file.exists():

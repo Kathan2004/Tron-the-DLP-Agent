@@ -544,35 +544,7 @@
       const apiUrl = (ctx.apiUrl || "").trim();
       let uploaded = false;
 
-      // Primary path: direct multipart upload from content context.
-      if (apiUrl) {
-        try {
-          const fd = new FormData();
-          fd.append("file", file, file.name || "upload.bin");
-          fd.append("agent_id", ctx.agentId || "");
-          fd.append("hostname", ctx.hostname || "");
-          fd.append("user", ctx.user || "browser_user");
-          fd.append("source_host", window.location.hostname || "unknown");
-          fd.append("file_name", file.name || "upload.bin");
-          fd.append("file_type", file.type || "application/octet-stream");
-          fd.append("file_size", String(file.size || 0));
-          fd.append("scan_id", scanResult?.scanId || "");
-          fd.append("action", scanResult?.action || "block");
-          fd.append("severity", scanResult?.severity || "high");
-          fd.append("findings", JSON.stringify(scanResult?.findings || []));
-
-          const res = await fetch(`${apiUrl}/api/browser/artifact/raw`, {
-            method: "POST",
-            headers: { "ngrok-skip-browser-warning": "true" },
-            body: fd,
-          });
-          uploaded = !!res.ok;
-        } catch (_) {
-          uploaded = false;
-        }
-      }
-
-      // Fallback path: background worker uploads multipart.
+      // Uploads go through the service worker, which holds the agent credentials.
       if (!uploaded) {
         const fileBuffer = await file.arrayBuffer();
         await new Promise((resolve) => {
@@ -642,10 +614,8 @@
         }
       };
 
-      await fetch(`${apiUrl}/api/browser/incident`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
-        body: JSON.stringify(payload),
+      await new Promise((resolve) => {
+        chrome.runtime.sendMessage({ type: "PROXY_API_POST", path: "/api/browser/incident", payload }, () => resolve());
       });
     } catch (_) {
       // best effort; keep block behavior unchanged
