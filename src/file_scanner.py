@@ -10,6 +10,7 @@ quick_scan, redact_for_llm).
 """
 
 import hashlib
+import logging
 import os
 import subprocess
 import sys
@@ -121,7 +122,7 @@ def edm_indexes() -> List[EDMIndex]:
             if _edm_cache is None:
                 _edm_cache = load_indexes()
                 if _edm_cache:
-                    print(f"  ✅ EDM: {', '.join(i.name for i in _edm_cache)}")
+                    logging.getLogger("tron.scanner").info("EDM indexes loaded: %s", ", ".join(i.name for i in _edm_cache))
     return _edm_cache
 
 
@@ -139,6 +140,25 @@ def _edm_findings(text: str, indexes: List[EDMIndex]) -> List["ScanFinding"]:
     return out
 
 
+_IDM_SEVERITY = {"CRITICAL": "critical", "HIGH": "high", "MEDIUM": "medium", "LOW": "low"}
+
+
+def _idm_findings(text: str, idm) -> List["ScanFinding"]:
+    """Findings for protected documents (src/detection/idm.py) present in the text."""
+    out = []
+    for m in idm.match(text):
+        pct = round(m.containment * 100)
+        out.append(ScanFinding(
+            pattern_name="IDM_MATCH", matched_text=f"<protected document: {m.name}>",
+            line_number=0, severity=_IDM_SEVERITY.get(str(m.sensitivity).upper(), "high"),
+            confidence=min(0.99, 0.6 + m.containment * 0.4),
+            context=f"{m.matched} of {m.total} fingerprints of '{m.name}' ({m.doc_id}) present ({pct}%)",
+            description=f"Protected document match: {m.name} ({pct}% of the document)",
+            category="Protected Document", validated=True, source="idm",
+        ))
+    return out
+
+
 def _to_finding(m: Match, source: str = "builtin") -> ScanFinding:
     return ScanFinding(
         pattern_name=m.detector, matched_text=m.value, line_number=m.line,
@@ -152,7 +172,7 @@ class FileContentScanner:
     """Scans text and files for sensitive data."""
 
     def __init__(self, engine: Optional[DetectionEngine] = None, ocr: bool = True,
-                 edm: Optional[List[EDMIndex]] = None, detector_store=None):
+                 edm: Optional[List[EDMIndex]] = None, detector_store=None, idm=None):
         """
         engine          fixed engine (tests); default is the built-in library
         detector_store  DetectorConfigStore: console overrides + custom detectors (API, agents)
@@ -161,6 +181,7 @@ class FileContentScanner:
         self.detector_store = detector_store
         self.ocr = ocr
         self.edm = edm if edm is not None else edm_indexes()
+        self.idm = idm  # IDMIndex (server side); None on agents
         self._policy_rules: List[dict] = []
         self._policy_version = None
         self._engine_key = None
@@ -213,6 +234,8 @@ class FileContentScanner:
         findings = [_to_finding(m) for m in self.engine.scan(text).matches]
         if self.edm:
             findings.extend(_edm_findings(text, self.edm))
+        if self.idm is not None and self.idm.active:
+            findings.extend(_idm_findings(text, self.idm))
         return findings
 
     # ------------------------------------------------------------------ files
@@ -233,7 +256,8 @@ class FileContentScanner:
         """Scan in-memory content. Returns (result, extraction); extraction is None on cache hit."""
         started = datetime.now()
         file_hash = hashlib.sha256(data).hexdigest()
-        key = (file_hash, self.cache_key)
+        idm_active = self.idm is not None and self.idm.active
+        key = (file_hash, self.cache_key, self.idm.generation if idm_active else None)
         with self._cache_lock:
             cached = self._cache.get(key)
             if cached is not None:
@@ -252,6 +276,12 @@ class FileContentScanner:
             findings.extend(edm_hits)
             if edm_hits:
                 counts["EDM_MATCH"] = len(edm_hits)
+
+        if idm_active and ext.text:
+            idm_hits = _idm_findings(ext.text, self.idm)
+            findings.extend(idm_hits)
+            if idm_hits:
+                counts["IDM_MATCH"] = len(idm_hits)
 
         if ext.encrypted:
             findings.append(ScanFinding(

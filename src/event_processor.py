@@ -1,5 +1,6 @@
 import json
 import hashlib
+import uuid
 from datetime import datetime, timedelta
 from typing import List, Optional, Any
 from src.rules_engine import RulesEngine
@@ -44,7 +45,9 @@ class EventProcessor:
         
         # Create event
         event = Event(
-            event_id=f"EVT-{hashlib.md5(payload_hash.encode()).hexdigest()[:8].upper()}",
+            # Unique per occurrence. (IDs derived from the payload made a repeated payload
+            # overwrite the earlier event, so thresholds never counted repeats.)
+            event_id=f"EVT-{uuid.uuid4().hex[:12].upper()}",
             timestamp=datetime.now().isoformat(),
             agent_type=agent_type,
             source_host=source_host,
