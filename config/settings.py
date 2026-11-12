@@ -29,12 +29,10 @@ class Config:
     JIRA_TOKEN = os.getenv("JIRA_TOKEN")
     
     # Flask
-    FLASK_PORT = int(os.getenv("FLASK_PORT", "5000"))
-    FLASK_HOST = os.getenv("FLASK_HOST", "0.0.0.0")
+    # Loopback by default; bind wider explicitly (the Docker image sets 0.0.0.0).
+    FLASK_PORT = int(os.getenv("FLASK_PORT", "5001"))
+    FLASK_HOST = os.getenv("FLASK_HOST", "127.0.0.1")
     DEBUG = os.getenv("DEBUG", "False").lower() == "true"
-    
-    # Redis
-    REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
     
     # DLP Rules
     FP_AUTO_CLOSE_THRESHOLD = 0.85  # Close if FP prob > 85%
