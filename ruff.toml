@@ -1,0 +1,11 @@
+# Correctness-focused lint: undefined names, unused imports/variables, syntax errors,
+# mutable defaults and shell injection. Style is not enforced.
+target-version = "py311"
+line-length = 140
+extend-exclude = ["siem-console", "browser-extension", "venv"]
+
+[lint]
+select = ["F", "E9", "B006", "B008", "S602", "S604", "S605"]
+
+[lint.per-file-ignores]
+"tests/*" = ["S"]

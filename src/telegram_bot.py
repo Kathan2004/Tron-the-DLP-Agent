@@ -9,8 +9,6 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from config.settings import Config
 from src.incident_store import IncidentStore
-import asyncio
-import re
 import traceback
 from typing import Any
 
@@ -518,7 +516,6 @@ class DLPTelegramBot:
 
     async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Log Errors caused by Updates quietly to avoid huge tracebacks in console"""
-        import traceback
         
         # Format the error message
         error_msg = scrub_token(context.error)

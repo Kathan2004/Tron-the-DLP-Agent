@@ -8,11 +8,8 @@ for data exfiltration patterns. Uses native macOS/Linux tools.
 import os
 import sys
 import re
-import json
 import subprocess
 import socket
-import time
-import threading
 from datetime import datetime
 from typing import List, Dict, Optional, Set
 from dataclasses import dataclass, asdict
@@ -67,6 +64,9 @@ PERSONAL_EMAIL_DOMAINS = {
 }
 
 
+from src import platform_support  # noqa: E402
+
+
 @dataclass
 class NetworkEvent:
     """A detected network event."""
@@ -92,7 +92,7 @@ class NetworkMonitor:
     def __init__(self):
         self.platform = sys.platform
         self.hostname = socket.gethostname()
-        self.user = os.getenv("USER", "unknown")
+        self.user = platform_support.username()
         self._seen_connections: Set[str] = set()
         self._dns_cache: Dict[str, str] = {}
 
@@ -117,12 +117,15 @@ class NetworkMonitor:
                 )
                 connections = self._parse_ss(result.stdout)
 
+            elif platform_support.IS_WINDOWS:
+                connections = platform_support.windows_connections()
+
         except subprocess.TimeoutExpired:
-            print("⚠️  Network scan timed out")
+            print(" Network scan timed out")
         except FileNotFoundError as e:
-            print(f"⚠️  Tool not found: {e}")
+            print(f" Tool not found: {e}")
         except Exception as e:
-            print(f"⚠️  Network monitoring error: {e}")
+            print(f" Network monitoring error: {e}")
 
         return connections
 
@@ -133,7 +136,7 @@ class NetworkMonitor:
         try:
             if self.platform == "darwin":
                 # macOS: check DNS cache
-                result = subprocess.run(
+                subprocess.run(
                     ["dscacheutil", "-cachedump", "-entries"],
                     capture_output=True, text=True, timeout=5
                 )
@@ -144,7 +147,7 @@ class NetworkMonitor:
             # In production, you'd want a DNS proxy or tap
 
         except Exception as e:
-            print(f"⚠️  DNS monitoring error: {e}")
+            print(f" DNS monitoring error: {e}")
 
         return queries
 
@@ -369,7 +372,7 @@ class NetworkMonitor:
             connections.append({
                 "process": process,
                 "pid": pid,
-                "user": os.getenv("USER", "unknown"),
+                "user": platform_support.username(),
                 "local_addr": local,
                 "remote_addr": remote_addr,
                 "remote_port": remote_port,
@@ -407,13 +410,15 @@ class ProcessMonitor:
 
     def __init__(self):
         self.platform = sys.platform
-        self.user = os.getenv("USER", "unknown")
+        self.user = platform_support.username()
         self._known_pids: Set[int] = set()
 
     def get_running_processes(self) -> List[Dict]:
         """Get list of running processes."""
         processes = []
         try:
+            if platform_support.IS_WINDOWS:
+                return platform_support.windows_processes()
             if self.platform == "darwin":
                 result = subprocess.run(
                     ["ps", "aux"],
@@ -447,7 +452,7 @@ class ProcessMonitor:
                             "process_name": Path(parts[10].split()[0]).name if parts[10] else "unknown"
                         })
         except Exception as e:
-            print(f"⚠️  Process monitoring error: {e}")
+            print(f" Process monitoring error: {e}")
 
         return processes
 
@@ -476,7 +481,7 @@ class ProcessMonitor:
             # Check for data being piped to curl/wget
             elif "curl" in command and ("post" in command or "-d" in command or "--data" in command):
                 risk_level = "high"
-                reason = f"Data upload via curl detected"
+                reason = "Data upload via curl detected"
 
             # Check for base64 encoding (common exfil technique)
             elif "base64" in command:
@@ -487,7 +492,7 @@ class ProcessMonitor:
             elif any(tool in command for tool in ["zip", "tar", "gzip", "7z"]):
                 if any(kw in command for kw in ["password", "secret", "credential", "key", "aadhaar", "pan"]):
                     risk_level = "high"
-                    reason = f"Compression of potentially sensitive files"
+                    reason = "Compression of potentially sensitive files"
 
             if risk_level:
                 suspicious.append({
@@ -540,15 +545,10 @@ class BrowserHistoryScanner:
         history = []
 
         try:
-            if self.platform == "darwin":
-                history_path = Path.home() / "Library/Application Support/Google/Chrome/Default/History"
-            elif self.platform == "linux":
-                history_path = Path.home() / ".config/google-chrome/Default/History"
-            else:
+            candidates = platform_support.chromium_history_files()
+            if not candidates:
                 return []
-
-            if not history_path.exists():
-                return []
+            history_path = candidates[0]
 
             # Copy the file since Chrome locks it
             import shutil
@@ -587,7 +587,7 @@ class BrowserHistoryScanner:
             os.unlink(tmp_path)
 
         except Exception as e:
-            print(f"⚠️  Browser history scan error: {e}")
+            print(f" Browser history scan error: {e}")
 
         return history
 
@@ -637,7 +637,7 @@ class BrowserHistoryScanner:
             os.unlink(tmp_path)
 
         except Exception as e:
-            print(f"⚠️  Safari history scan error: {e}")
+            print(f" Safari history scan error: {e}")
 
         return history
 
@@ -681,11 +681,7 @@ class ShellHistoryScanner:
     def scan_shell_history(self) -> List[Dict]:
         """Scan shell history files for suspicious commands."""
         findings = []
-        history_files = [
-            Path.home() / ".bash_history",
-            Path.home() / ".zsh_history",
-            Path.home() / ".local/share/fish/fish_history",
-        ]
+        history_files = platform_support.shell_history_files()
 
         for hist_file in history_files:
             if not hist_file.exists():
@@ -715,7 +711,7 @@ class ShellHistoryScanner:
                             break
 
             except Exception as e:
-                print(f"⚠️  Cannot read {hist_file}: {e}")
+                print(f" Cannot read {hist_file}: {e}")
 
         return findings
 
@@ -734,11 +730,11 @@ if __name__ == "__main__":
             print(f"  [{e.risk_level.upper()}] {e.event_type}: {e.process} -> {e.domain or e.remote_addr}:{e.remote_port}")
             print(f"    {e.details}")
     else:
-        print("  ✅ No suspicious connections detected")
+        print("  No suspicious connections detected")
 
     # Process scan
     print(f"\n{'=' * 50}")
-    print("⚙️  Suspicious Processes")
+    print(" Suspicious Processes")
     print("=" * 50)
     proc = ProcessMonitor()
     suspicious = proc.check_suspicious_processes()
@@ -747,7 +743,7 @@ if __name__ == "__main__":
             print(f"  [{s['risk_level'].upper()}] {s['process']} (PID: {s['pid']})")
             print(f"    {s['reason']}")
     else:
-        print("  ✅ No suspicious processes detected")
+        print("  No suspicious processes detected")
 
     # Shell history
     print(f"\n{'=' * 50}")
@@ -760,4 +756,4 @@ if __name__ == "__main__":
             print(f"  [{f['severity'].upper()}] {f['description']}")
             print(f"    {f['command'][:80]}")
     else:
-        print("  ✅ No suspicious commands in shell history")
+        print("  No suspicious commands in shell history")

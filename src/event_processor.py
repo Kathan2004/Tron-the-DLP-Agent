@@ -1,5 +1,5 @@
-import json
 import hashlib
+import uuid
 from datetime import datetime, timedelta
 from typing import List, Optional, Any
 from src.rules_engine import RulesEngine
@@ -44,7 +44,9 @@ class EventProcessor:
         
         # Create event
         event = Event(
-            event_id=f"EVT-{hashlib.md5(payload_hash.encode()).hexdigest()[:8].upper()}",
+            # Unique per occurrence. (IDs derived from the payload made a repeated payload
+            # overwrite the earlier event, so thresholds never counted repeats.)
+            event_id=f"EVT-{uuid.uuid4().hex[:12].upper()}",
             timestamp=datetime.now().isoformat(),
             agent_type=agent_type,
             source_host=source_host,
@@ -141,7 +143,7 @@ class EventProcessor:
                 events=existing_incident.events
             )
             
-            print(f"⚠️ REPEAT EXFILTRATION: User {user} attempted {existing_incident.repeat_count + 1}x in 24h")
+            print(f"REPEAT EXFILTRATION: User {user} attempted {existing_incident.repeat_count + 1}x in 24h")
             return existing_incident
         else:
             # New incident
@@ -166,7 +168,7 @@ class EventProcessor:
                 dedup_key=dedup_key,
             )
             
-            print(f"🚨 NEW INCIDENT: {incident.incident_id} - User {user} attempted to exfiltrate {pattern_str}")
+            print(f"NEW INCIDENT: {incident.incident_id} - User {user} attempted to exfiltrate {pattern_str}")
             
             # Send initial Telegram alert
             self._send_telegram_alert(incident, f"NEW EXFILTRATION: {incident.user}")
@@ -189,11 +191,11 @@ class EventProcessor:
                         ),
                         loop
                     )
-                    print(f"📱 TELEGRAM ALERT QUEUED: {incident.incident_id}")
+                    print(f"TELEGRAM ALERT QUEUED: {incident.incident_id}")
                 else:
-                    print(f"⚠️ Telegram loop not running, could not send to {incident.incident_id}")
+                    print(f"Telegram loop not running, could not send to {incident.incident_id}")
             except Exception as e:
-                print(f"⚠️ Telegram alert failed: {scrub_token(e)}")
+                print(f"Telegram alert failed: {scrub_token(e)}")
                 
     def _check_and_escalate_repeats(self, incident):
         """Auto-escalate repeated exfiltration attempts"""
@@ -218,7 +220,7 @@ class EventProcessor:
                 # Send to Slack immediately
                 if self.escalation_engine:
                     self.escalation_engine.escalate_to_slack(incident.to_dict())
-                    print(f"🚨 AUTO-ESCALATED TO SLACK: {incident.incident_id}")
+                    print(f"AUTO-ESCALATED TO SLACK: {incident.incident_id}")
             
             return True
         
@@ -252,7 +254,7 @@ class EscalationEngine:
             
             # Format for Slack
             payload = {
-                "text": f"🚨 DLP Incident Escalation — {incident_dict['incident_id']}",
+                "text": f"DLP Incident Escalation — {incident_dict['incident_id']}",
                 "attachments": [
                     {
                         "color": "danger" if incident_dict.get('verdict') == "LIKELY_THREAT" else "warning",
@@ -271,7 +273,7 @@ class EscalationEngine:
             
             import requests
             response = requests.post(self.slack_webhook, json=payload, timeout=10)
-            print(f"✅ Escalated to Slack: {response.status_code}")
+            print(f"Escalated to Slack: {response.status_code}")
             return response.status_code == 200
         except Exception as e:
             print(f"Slack escalation error: {e}")
@@ -282,7 +284,7 @@ class EscalationEngine:
         """Create Jira ticket"""
         
         if not all([self.jira_server, self.jira_user, self.jira_token]):
-            print("ℹ️ Jira credentials not configured - skipping ticket creation")
+            print("ℹJira credentials not configured - skipping ticket creation")
             return None
         
         try:
@@ -316,10 +318,10 @@ FP Probability: {incident_dict.get('fp', 0)}%""",
             
             if response.status_code == 201:
                 ticket = response.json()
-                print(f"✅ Jira ticket created: {ticket.get('key', 'N/A')}")
+                print(f"Jira ticket created: {ticket.get('key', 'N/A')}")
                 return ticket.get('key')
             else:
-                print(f"⚠️ Jira error: {response.status_code}")
+                print(f"Jira error: {response.status_code}")
                 return None
         except Exception as e:
             print(f"Jira escalation error: {e}")

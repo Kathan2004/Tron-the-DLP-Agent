@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Dict, Optional
+from typing import Dict
 import requests
 from config.settings import Config
 from src.file_scanner import redact_for_llm
@@ -45,7 +45,7 @@ Respond with ONLY this JSON (no extra text):
 
         try:
             if not self.api_key:
-                print("⚠️ GOOGLE_GENAI_API_KEY not set")
+                print("GOOGLE_GENAI_API_KEY not set")
                 return self._default_analysis()
             
             headers = {
@@ -65,7 +65,7 @@ Respond with ONLY this JSON (no extra text):
             response = requests.post(url, json=payload, headers=headers, timeout=30)
             
             if response.status_code != 200:
-                print(f"⚠️ Gemini API error: {response.status_code}")
+                print(f"Gemini API error: {response.status_code}")
                 return self._default_analysis()
             
             result = response.json()
@@ -79,13 +79,13 @@ Respond with ONLY this JSON (no extra text):
                     analysis = json.loads(json_str)
                     return analysis
                 except json.JSONDecodeError:
-                    print(f"⚠️ Could not parse AI response JSON")
+                    print("Could not parse AI response JSON")
                     return self._default_analysis()
             
             return self._default_analysis()
         
         except Exception as e:
-            print(f"⚠️ AI analysis error: {e}")
+            print(f"AI analysis error: {e}")
             return self._default_analysis()
     
     def generate_rule_from_prompt(self, user_prompt: str) -> Dict:
@@ -130,7 +130,7 @@ Prefer 'builtin' when one fits. Use 'detector' with a validator whenever the for
             response = requests.post(url, json=payload, headers=headers, timeout=30)
             
             if response.status_code != 200:
-                print(f"⚠️ Rule Generation failed: {response.status_code} - {response.text}")
+                print(f"Rule Generation failed: {response.status_code} - {response.text}")
                 return {"error": f"AI Service error: {response.status_code}"}
                 
             result = response.json()
@@ -139,11 +139,11 @@ Prefer 'builtin' when one fits. Use 'detector' with a validator whenever the for
                 json_str = self._extract_json(text)
                 return json.loads(json_str)
                 
-            print(f"⚠️ Rule Generation empty response: {result}")
+            print(f"Rule Generation empty response: {result}")
             return {"error": "AI could not generate a rule for this prompt. Try a more specific request."}
             
         except Exception as e:
-            print(f"⚠️ Rule Generation exception: {e}")
+            print(f"Rule Generation exception: {e}")
             return {"error": f"Internal Error: {str(e)}"}
 
     def _extract_json(self, text: str) -> str:

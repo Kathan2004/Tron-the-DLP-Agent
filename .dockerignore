@@ -1,4 +1,5 @@
 .git
+.github
 .env
 .env.*
 !.env.example
@@ -13,6 +14,8 @@ venv/
 *.db
 *.db-wal
 *.db-shm
-siem-console/
+**/node_modules/
+siem-console/dist/
 browser-extension/
 docs/
+tests/

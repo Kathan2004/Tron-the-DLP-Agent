@@ -1,22 +1,56 @@
+# Tron DLP: API + console. For TLS add `--profile tls` and set TRON_DOMAIN (docs/deployment.md).
 services:
   tron-api:
     build: .
-    ports:
-      - "5001:5001"
-    env_file:
-      - .env
+    env_file: .env
     environment:
-      - GCP_CREDENTIALS_PATH=/app/config/service-account.json
-      - FLASK_HOST=0.0.0.0
-      - FLASK_PORT=5001
-      - DEBUG=False
+      FLASK_HOST: 0.0.0.0
+      FLASK_PORT: "5001"
+      DEBUG: "False"
+      # Two proxy hops in front of the API in the tls profile (Caddy -> nginx), one otherwise.
+      TRON_TRUSTED_PROXIES: ${TRON_TRUSTED_PROXIES:-1}
     volumes:
-      - ./config/service-account.json:/app/config/service-account.json:ro
-      - ./data:/app/data
+      - tron-data:/app/data
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5001/api/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    # Not published: reachable only through the console's reverse proxy.
+    expose:
+      - "5001"
+
+  console:
+    build: ./siem-console
+    depends_on:
+      tron-api:
+        condition: service_healthy
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      # Loopback only. Expose it through the tls profile or your own reverse proxy.
+      - "127.0.0.1:8080:8080"
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: [tls]
+    depends_on: [console]
+    restart: unless-stopped
+    environment:
+      TRON_DOMAIN: ${TRON_DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  tron-data:
+  caddy-data:
+  caddy-config:

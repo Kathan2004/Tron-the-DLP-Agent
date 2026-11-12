@@ -76,7 +76,6 @@ def test_generated_values_are_detected():
 # ------------------------------------------------------------------ API
 @pytest.fixture()
 def client(tmp_path):
-    from tests.test_api import client as _client  # noqa: F401  (reuse fixture logic)
     from src import api
     from src.ai_analyzer import FalsePositiveClassifier, VertexAIAnalyzer
     from src.event_processor import EscalationEngine, EventProcessor

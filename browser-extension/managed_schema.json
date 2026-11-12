@@ -8,7 +8,7 @@
     },
     "agentToken": {
       "title": "Agent enrollment token",
-      "description": "Must match TRON_AGENT_TOKEN on the API server.",
+      "description": "Must match TRON_AGENT_TOKEN on the API server. Used once to obtain this browser's own agent key.",
       "type": "string"
     }
   }

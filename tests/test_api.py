@@ -8,30 +8,6 @@ import pytest
 from tests import fixtures as F
 
 
-@pytest.fixture()
-def client(tmp_path, monkeypatch):
-    from src import api
-    from src.ai_analyzer import FalsePositiveClassifier, VertexAIAnalyzer
-    from src.database import Database
-    from src.event_processor import EscalationEngine, EventProcessor
-    from src.incident_store import IncidentStore
-    from src.rules_engine import RulesEngine
-    from src.telegram_bot import DLPTelegramBot
-
-    db = Database(str(tmp_path / "test.db"))
-    store = IncidentStore(db=db)
-    rules = RulesEngine()
-    rules.db = db
-    processor = EventProcessor(rules, store)
-    bot = DLPTelegramBot(store)
-    analyzer = VertexAIAnalyzer()
-    api.init_components(store, rules, processor, EscalationEngine(), analyzer,
-                        FalsePositiveClassifier(analyzer), bot, db)
-    api.app.config["TESTING"] = True
-    with api.app.test_client() as c:
-        yield c
-
-
 def post(client, path, body, token=None):
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     return client.post(path, data=json.dumps(body), content_type="application/json", headers=headers)
@@ -101,8 +77,7 @@ def test_request_size_cap(client):
 
 
 def test_agent_token_enforced_on_ingestion_when_configured(client, monkeypatch):
-    from src import api
-    monkeypatch.setattr(api, "AGENT_TOKEN", "enroll-123")
+    monkeypatch.setenv("TRON_AGENT_TOKEN", "enroll-123")
     event = {"agent_type": "endpoint", "source_host": "h", "user": "u", "channel": "clipboard", "payload": "x"}
     assert post(client, "/api/events", event).status_code == 401
     assert post(client, "/api/fleet/checkin", {"agent_id": "a"}).status_code == 401

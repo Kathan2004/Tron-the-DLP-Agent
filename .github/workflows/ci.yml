@@ -23,9 +23,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tesseract-ocr
       - name: Install
         run: pip install -r requirements-dev.txt
+      - name: Lint (undefined names, unused code, shell injection)
+        run: ruff check .
+      - name: Dependency audit
+        run: pip-audit -r requirements.txt
       - name: Extension detectors are generated from the Python library
         run: python scripts/build_extension_detectors.py --check
-      - name: Tests (detection, extraction, rules engine, API, extension parity)
+      - name: Tests (detection, extraction, rules engine, API, platform, agents, extension parity)
         run: python -m pytest -q
       - name: Detection benchmark
         run: python scripts/benchmark_detection.py
@@ -43,8 +47,30 @@ jobs:
           cache: npm
           cache-dependency-path: siem-console/package-lock.json
       - run: npm ci
+      - run: npm audit --audit-level=high
       - run: npm run lint
       - run: npm run build
+
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build API and console images
+        run: |
+          docker build -t tron-api:ci .
+          docker build -t tron-console:ci siem-console
+      - name: API container starts healthy as a non-root, read-only container
+        run: |
+          docker run -d --name api --read-only --tmpfs /tmp --cap-drop ALL \
+            -e APP_AUTH_SECRET=ci-only-secret-ci-only-secret -e APP_ADMIN_PASSWORD='Ci-Only-Pass-12345!' \
+            -p 127.0.0.1:5001:5001 tron-api:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:5001/api/health >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:5001/api/health
+          test "$(docker exec api id -u)" = "10001"
+          docker logs api
 
   extension:
     runs-on: ubuntu-latest

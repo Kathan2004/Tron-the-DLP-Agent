@@ -9,7 +9,6 @@ Offline rule suggestions for the Lab (used when no LLM is configured, and to san
 from __future__ import annotations
 
 import re
-from typing import Optional
 
 from src.detection.config import validate_custom
 

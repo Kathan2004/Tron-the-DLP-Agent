@@ -8,9 +8,79 @@ importScripts("detectors.js");
 importScripts("scanner.js");
 importScripts("ai_analyzer.js");
 
-// Enrollment token header for Tron API calls (only when configured).
+// ─── Agent credentials ───────────────────────────────────────
+// The extension enrolls once with the enrollment token (pushed by enterprise policy) and
+// then authenticates with its own key, kept in chrome.storage.local. The key never leaves
+// the service worker: content scripts ask the worker to make API calls on their behalf.
+let agentCredential = null;   // { apiUrl, agentId, agentKey }
+let enrollPromise = null;
+
 function agentAuthHeaders() {
+    if (agentCredential && agentCredential.apiUrl === settings.apiUrl) {
+        return { 'X-Tron-Agent-Id': agentCredential.agentId, 'X-Tron-Agent-Key': agentCredential.agentKey };
+    }
     return settings && settings.agentToken ? { 'X-Tron-Agent-Token': String(settings.agentToken) } : {};
+}
+
+async function ensureEnrolled() {
+    if (!settings.apiUrl || !settings.agentToken) return false;
+    if (agentCredential && agentCredential.apiUrl === settings.apiUrl) return true;
+    if (enrollPromise) return enrollPromise;
+    enrollPromise = (async () => {
+        try {
+            const aid = await getAgentIdentity();
+            const res = await fetch(`${settings.apiUrl}/api/fleet/enroll`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true',
+                           'X-Tron-Agent-Token': String(settings.agentToken) },
+                body: JSON.stringify({ agent_id: aid.agentId, agent_type: 'browser_extension', hostname: aid.hostname }),
+            });
+            if (res.status !== 201) return false;
+            const body = await res.json();
+            agentCredential = { apiUrl: settings.apiUrl, agentId: aid.agentId, agentKey: body.agent_key };
+            await storageSet({ agentCredential });
+            return true;
+        } catch (_) {
+            return false;
+        } finally {
+            enrollPromise = null;
+        }
+    })();
+    return enrollPromise;
+}
+
+async function rotateAgentKey() {
+    if (!agentCredential) return;
+    try {
+        const res = await fetch(`${settings.apiUrl}/api/fleet/agents/${encodeURIComponent(agentCredential.agentId)}/key/rotate`, {
+            method: 'POST',
+            headers: { 'ngrok-skip-browser-warning': 'true', ...agentAuthHeaders() },
+        });
+        if (!res.ok) return;
+        const body = await res.json();
+        agentCredential = { ...agentCredential, agentKey: body.agent_key };
+        await storageSet({ agentCredential });
+    } catch (_) {
+        // Old key stays valid; the server re-queues nothing, an operator can retry.
+    }
+}
+
+// Content scripts may only relay to these ingest endpoints.
+const PROXY_POST_PATHS = new Set(['/api/browser/incident']);
+
+async function proxyApiPost(path, payload) {
+    if (!settings.apiUrl || !PROXY_POST_PATHS.has(path)) return { ok: false };
+    try {
+        await ensureEnrolled();
+        const res = await fetch(`${settings.apiUrl}${path}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true', ...agentAuthHeaders() },
+            body: JSON.stringify(payload || {}),
+        });
+        return { ok: res.ok, status: res.status };
+    } catch (_) {
+        return { ok: false };
+    }
 }
 
 // ─── Default Settings ────────────────────────────────────────
@@ -143,9 +213,11 @@ async function applyEnterprisePolicy() {
 }
 
 // Load settings on startup
-chrome.storage.local.get(["settings", "scanHistory", "stats", "dynamicPatterns", "detectorConfig", "pendingArtifactQueue", POLICY_HIT_TRACKER_STORAGE_KEY], async (data) => {
+chrome.storage.local.get(["settings", "scanHistory", "stats", "dynamicPatterns", "detectorConfig", "pendingArtifactQueue", "agentCredential", POLICY_HIT_TRACKER_STORAGE_KEY], async (data) => {
     if (data.settings) settings = { ...DEFAULT_SETTINGS, ...data.settings };
     await applyEnterprisePolicy();
+    if (data.agentCredential && data.agentCredential.agentKey) agentCredential = data.agentCredential;
+    await ensureEnrolled();
     if (data.scanHistory) scanHistory = data.scanHistory || [];
     if (data.stats) stats = { ...stats, ...data.stats };
     if (Array.isArray(data.pendingArtifactQueue)) pendingArtifactQueue = data.pendingArtifactQueue;
@@ -187,7 +259,8 @@ async function fleetCheckin() {
         const aid = await getAgentIdentity();
         const meta = await buildAgentMeta();
         const userIdentity = await getBestEffortUserIdentity();
-        await fetch(`${settings.apiUrl}/api/fleet/checkin`, {
+        await ensureEnrolled();
+        const checkinRes = await fetch(`${settings.apiUrl}/api/fleet/checkin`, {
             method: "POST",
             headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true", ...agentAuthHeaders() },
             body: JSON.stringify({
@@ -207,6 +280,14 @@ async function fleetCheckin() {
                 },
             })
         });
+        if (checkinRes.status === 401 && agentCredential) {
+            // Key revoked in the console: drop it and enroll again on the next cycle.
+            agentCredential = null;
+            await storageSet({ agentCredential: null });
+        } else if (checkinRes.ok) {
+            const body = await checkinRes.json().catch(() => ({}));
+            if (body && body.command && body.command.type === 'rotate_key') await rotateAgentKey();
+        }
     } catch (err) {
         // Silent fail
     }
@@ -517,6 +598,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }).catch(() => {
             sendResponse({ apiUrl: settings.apiUrl, agentId: '', hostname: '', user: 'browser_user' });
         });
+        return true;
+    }
+
+    if (message.type === "PROXY_API_POST") {
+        proxyApiPost(String(message.path || ''), message.payload).then(sendResponse);
         return true;
     }
 

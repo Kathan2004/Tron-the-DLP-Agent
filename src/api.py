@@ -7,18 +7,19 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import io
 import json
+import logging
 import os
 import queue
 import re
 import secrets
-import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from config.settings import Config
 from flask import Flask, jsonify, request, send_file, g
 from flask_cors import CORS
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
@@ -33,28 +34,33 @@ from src.detection import get_engine as get_detection_engine, DETECTORS
 from src.detection import config as detector_config
 from src.detection.config import DetectorConfigStore
 from src.detection.engine import DetectionEngine
+from src.detection.idm import IDMIndex
 from src.detection.generators import DETECTOR_GENERATORS, GENERATORS, generate as generate_samples
 from src.detection.validators import VALIDATOR_INFO, VALIDATORS
 from src.file_scanner import configure_redaction
 from src.telegram_bot import DLPTelegramBot, scrub_token
+from src import agent_auth, metrics, security
+from src.retention import RetentionWorker
+from src.siem import SiemForwarder
+
+log = logging.getLogger("tron.api")
+APP_VERSION = "2.1.0"
 
 app = Flask(__name__)
+security.install(app)
 # Hard cap on request bodies (base64 of a 50 MB file is ~67 MB).
 app.config['MAX_CONTENT_LENGTH'] = int(os.getenv('APP_MAX_REQUEST_MB', '75')) * 1024 * 1024
 
-# Console API: only the configured console origins may call it cross-origin.
-# Unauthenticated ingest endpoints used by the browser extension's content script
-# (which runs under the visited page's origin) stay open to any origin.
+# Only the configured console origins may call the API cross-origin. Agents and the browser
+# extension's service worker are not subject to CORS; content scripts never call the API
+# directly (they relay through the service worker, which holds the agent key).
 CORS_ALLOWED_ORIGINS = [
     o.strip() for o in os.getenv(
         'APP_CORS_ORIGINS', 'http://localhost:5173,http://127.0.0.1:5173'
-    ).split(',') if o.strip()
+    ).split(',') if o.strip() and o.strip() != '*'
 ]
-CORS(app, resources={
-    r"/api/browser/.*": {"origins": "*"},
-    r"/api/scan/.*": {"origins": "*"},
-    r"/api/.*": {"origins": CORS_ALLOWED_ORIGINS},
-})
+CORS(app, resources={r"/api/.*": {"origins": CORS_ALLOWED_ORIGINS}},
+     allow_headers=["Authorization", "Content-Type", "X-Request-ID"], max_age=600)
 
 # These will be initialized in main.py
 incident_store: IncidentStore | None = None
@@ -67,13 +73,16 @@ telegram_bot: DLPTelegramBot | None = None
 database: Database | None = None
 file_scanner: FileContentScanner | None = None
 detector_store: DetectorConfigStore | None = None
+idm_index: IDMIndex | None = None
+siem_forwarder: SiemForwarder | None = None
+retention_worker: RetentionWorker | None = None
 browser_incident_lock = threading.Lock()
 
 AUTH_SECRET = os.getenv('APP_AUTH_SECRET', '').strip()
 if not AUTH_SECRET:
     AUTH_SECRET = secrets.token_urlsafe(48)
-    print("WARNING: APP_AUTH_SECRET is not set. Using a random per-run signing secret; "
-          "all console sessions will be invalidated on restart. Set APP_AUTH_SECRET in .env.")
+    log.warning("APP_AUTH_SECRET is not set. Using a random per-run signing secret; "
+                "all console sessions will be invalidated on restart. Set APP_AUTH_SECRET in .env.")
 AUTH_TOKEN_MAX_AGE_SECONDS = int(os.getenv('APP_AUTH_TOKEN_TTL_SECONDS', str(8 * 60 * 60)))
 AUTH_MAX_FAILED_ATTEMPTS = int(os.getenv('APP_AUTH_MAX_FAILED_ATTEMPTS', '5'))
 AUTH_LOCKOUT_MINUTES = int(os.getenv('APP_AUTH_LOCKOUT_MINUTES', '15'))
@@ -99,6 +108,7 @@ IAM_PERMISSION_CATALOG = {
     'users.manage': 'Manage user lifecycle and role assignments',
     'iam.manage': 'Manage IAM settings and role permissions',
     'ai_lab.manage': 'Manage AI lab and policy simulation controls',
+    'settings.manage': 'Manage platform settings (retention, SIEM forwarding, data protection)',
 }
 
 IAM_ROLE_DEFAULTS = {
@@ -269,8 +279,19 @@ def _required_permission_for_request(path: str, method: str) -> str | None:
         return 'incidents.manage' if m in {'POST', 'PUT', 'PATCH', 'DELETE'} else 'incidents.view'
     if p.startswith('/api/events'):
         return 'events.view' if m == 'GET' else None
-    if p in {'/api/stats', '/api/stream'}:
+    if p in {'/api/stats', '/api/stream/ticket', '/api/analytics', '/api/browser/stats'}:
         return 'dashboard.view'
+    if p.startswith('/api/settings') or p.startswith('/api/siem'):
+        return 'settings.manage'
+    if p.startswith('/api/idm'):
+        return 'policies.manage' if m in {'POST', 'PUT', 'PATCH', 'DELETE'} else 'policies.view'
+    if p.startswith('/api/scans') or p.startswith('/api/screenshots'):
+        return 'events.view'
+    if p in {'/api/scan/file', '/api/scan/clipboard'}:
+        # These read the API host's filesystem and clipboard.
+        return 'policies.manage'
+    if p == '/api/security-team':
+        return 'incidents.view'
     return None
 
 
@@ -380,7 +401,7 @@ def _bootstrap_local_admin() -> None:
             is_active=True,
             must_change_password=generated,
         )
-        print(f"🔐 Local admin bootstrapped: {DEFAULT_ADMIN_EMAIL}")
+        print(f"Local admin bootstrapped: {DEFAULT_ADMIN_EMAIL}")
         if generated:
             # Shown exactly once, only on the console of the process that created the account.
             print("=" * 64)
@@ -389,7 +410,7 @@ def _bootstrap_local_admin() -> None:
             print("  You must change it on first login. It will not be shown again.")
             print("=" * 64)
     except Exception as e:
-        print(f"⚠️ Local admin bootstrap failed: {e}")
+        print(f"Local admin bootstrap failed: {e}")
 
 
 def _is_public_api_request(path: str, method: str) -> bool:
@@ -409,7 +430,11 @@ def _is_public_api_request(path: str, method: str) -> bool:
         return True
     if p == '/api/screenshots' and m == 'POST':
         return True
-    if p == '/api/fleet/checkin' and m == 'POST':
+    if p in {'/api/fleet/checkin', '/api/fleet/enroll'} and m == 'POST':
+        return True
+    if p.startswith('/api/fleet/agents/') and p.endswith('/key/rotate') and m == 'POST':
+        return True
+    if p == '/api/metrics' and m == 'GET':
         return True
     if p.startswith('/api/fleet/agents/') and p.endswith('/operational') and m == 'POST':
         return True
@@ -420,21 +445,29 @@ def _is_public_api_request(path: str, method: str) -> bool:
     return False
 
 
-# Endpoints that never require the agent enrollment token.
-_UNAUTHENTICATED_PATHS = {'/api/health', '/api/auth/login', '/api/stream'}
-# Shared enrollment secret for agents and the browser extension. When set, every
-# agent-facing ingestion endpoint requires it in the X-Tron-Agent-Token header.
-AGENT_TOKEN = os.getenv('TRON_AGENT_TOKEN', '').strip()
-if not AGENT_TOKEN:
-    print("WARNING: TRON_AGENT_TOKEN is not set. Agent ingestion endpoints accept unauthenticated "
-          "events and check-ins from anyone who can reach the API.")
+# Endpoints that authenticate themselves (or need no authentication at all):
+# health, login, the ticketed event stream, token-gated metrics and agent enrollment.
+_UNAUTHENTICATED_PATHS = {'/api/health', '/api/auth/login', '/api/stream', '/api/metrics', '/api/fleet/enroll'}
+if agent_auth.auth_mode() == 'open':
+    log.warning("TRON_AGENT_TOKEN is not set. Agent ingestion endpoints accept unauthenticated "
+                "events and check-ins from anyone who can reach the API.")
 
 
-def _agent_token_ok() -> bool:
-    if not AGENT_TOKEN:
-        return True
-    supplied = request.headers.get('X-Tron-Agent-Token', '')
-    return bool(supplied) and hmac.compare_digest(supplied, AGENT_TOKEN)
+def _agent_identity() -> agent_auth.AgentIdentity | None:
+    """Agent identity established by the guard for ingest requests (None for console calls)."""
+    return getattr(g, 'agent', None)
+
+
+def _bound_agent_id(claimed: object | None = None) -> str:
+    """Agent ID for an ingest request.
+
+    A request authenticated with a per-agent key is always attributed to that key's agent,
+    whatever the body claims, so one agent cannot report as another.
+    """
+    ident = _agent_identity()
+    if ident and ident.method == 'key':
+        return ident.agent_id
+    return str(claimed or (ident.agent_id if ident else '') or '').strip()
 
 
 def _role_allowed(role: str, allowed_roles: set[str]) -> bool:
@@ -453,9 +486,28 @@ def _auth_guard():
     if not path.startswith('/api/'):
         return None
     if _is_public_api_request(path, method):
-        if path in _UNAUTHENTICATED_PATHS or _agent_token_ok():
+        if path in _UNAUTHENTICATED_PATHS:
+            bucket = {'/api/auth/login': 'login', '/api/fleet/enroll': 'enroll'}.get(path)
+            if bucket:
+                limited = security.check_rate(bucket, security.client_ip())
+                if limited is not None:
+                    return limited
             return None
-        return jsonify({'error': 'agent_token_required'}), 401
+        identity = agent_auth.authenticate(database, request.headers, security.client_ip())
+        if identity is None:
+            return jsonify({'error': 'agent_credentials_required'}), 401
+        g.agent = identity
+        # Only a key-authenticated ID is trustworthy as a rate-limit identity; a claimed ID
+        # could be varied per request to dodge the limit.
+        limited = security.check_rate(
+            'ingest', identity.agent_id if identity.method == 'key' else security.client_ip())
+        if limited is not None:
+            return limited
+        return None
+
+    limited = security.check_rate('console', security.client_ip())
+    if limited is not None:
+        return limited
 
     auth = request.headers.get('Authorization', '')
     if not auth.startswith('Bearer '):
@@ -530,10 +582,26 @@ def _auth_guard():
     if method in {'POST', 'PUT', 'PATCH', 'DELETE'} and g.current_role == 'VIEWER' and path not in {
         '/api/auth/change-password', '/api/auth/profile', '/api/auth/logout', '/api/auth/sessions/revoke',
         '/api/detectors/test', '/api/detectors/check', '/api/detectors/generate',
+        '/api/stream/ticket',
     }:
         return jsonify({'error': 'forbidden_read_only_role'}), 403
 
     return None
+
+
+def _server_error(exc: BaseException, message: str = "Internal server error"):
+    """Log the exception with its traceback; return an opaque 500 that carries the request ID."""
+    log.error("%s on %s %s", message, request.method, request.path,
+              exc_info=(type(exc), exc, exc.__traceback__))
+    return jsonify({"error": message, "request_id": getattr(g, 'request_id', None)}), 500
+
+
+def _limit_arg(default: int, maximum: int, name: str = 'limit') -> int:
+    """Bounded integer query parameter (callers cannot request unbounded result sets)."""
+    value = request.args.get(name, default, type=int)
+    if value is None:
+        value = default
+    return max(1, min(int(value), maximum))
 
 
 def _actor_from_request(default_actor: str = 'secops_analyst') -> str:
@@ -867,7 +935,7 @@ def _portal_activity_audit(response):
 def _safe_user_folder(user_value: object | None) -> str:
     """Convert user identifier into a safe folder name."""
     raw = str(user_value or "unknown_user").strip().lower()
-    safe = re.sub(r"[^a-z0-9._-]+", "_", raw)
+    safe = re.sub(r"[^a-z0-9._-]+", "_", raw).lstrip(".")
     return safe[:120] or "unknown_user"
 
 
@@ -1131,7 +1199,8 @@ def _aggregate_legacy_exceptions(exception_sets: list[dict], existing: dict | No
 def init_components(store, rules, processor, escalation, analyzer, classifier, bot, db=None):
     """Initialize components from main.py"""
     global incident_store, rules_engine, event_processor, escalation_engine
-    global ai_analyzer, fp_classifier, telegram_bot, database, file_scanner, detector_store
+    global ai_analyzer, fp_classifier, telegram_bot, database, file_scanner, detector_store, idm_index
+    global siem_forwarder, retention_worker
     incident_store = store
     rules_engine = rules
     event_processor = processor
@@ -1143,9 +1212,22 @@ def init_components(store, rules, processor, escalation, analyzer, classifier, b
     detector_store = DetectorConfigStore(database)
     if rules_engine is not None:
         rules_engine.detector_store = detector_store
-    file_scanner = FileContentScanner(detector_store=detector_store)
+    idm_index = IDMIndex(database) if database else None
+    file_scanner = FileContentScanner(detector_store=detector_store, idm=idm_index)
     configure_redaction(detector_store)
+    if database is not None:
+        siem_forwarder = SiemForwarder(database)
+        database.record_sinks.append(siem_forwarder.emit)
+        retention_worker = RetentionWorker(database, _artifacts_root())
     _bootstrap_local_admin()
+
+
+def start_background_workers() -> None:
+    """Start the SIEM forwarder and the retention job. Called once by the serving process."""
+    if siem_forwarder is not None:
+        siem_forwarder.start()
+    if retention_worker is not None:
+        retention_worker.start()
 
 
 def _policy_scanner() -> FileContentScanner | None:
@@ -1164,7 +1246,7 @@ def auth_login():
         return jsonify({'error': 'Database not initialized'}), 500
 
     _bootstrap_local_admin()
-    payload = request.json or {}
+    payload = (request.get_json(silent=True) or {})
     email = str(payload.get('email') or '').strip().lower()
     password = str(payload.get('password') or '')
 
@@ -1258,7 +1340,7 @@ def auth_change_password():
     if not user:
         return jsonify({'error': 'unauthorized'}), 401
 
-    payload = request.json or {}
+    payload = (request.get_json(silent=True) or {})
     old_password = str(payload.get('old_password') or '')
     new_password = str(payload.get('new_password') or '')
     policy_error = _validate_password_against_policy(new_password, str(user.get('email') or ''))
@@ -1333,7 +1415,7 @@ def auth_sessions():
 def auth_revoke_session():
     if not database:
         return jsonify({'error': 'Database not initialized'}), 500
-    payload = request.json or {}
+    payload = (request.get_json(silent=True) or {})
     target_sid = str(payload.get('session_id') or '').strip()
     revoke_all = bool(payload.get('revoke_all'))
     user = getattr(g, 'current_user', None) or {}
@@ -1368,7 +1450,7 @@ def auth_update_profile():
     if not user:
         return jsonify({'error': 'unauthorized'}), 401
 
-    payload = request.json or {}
+    payload = (request.get_json(silent=True) or {})
     updates: dict[str, object] = {}
 
     if 'display_name' in payload:
@@ -1417,7 +1499,7 @@ def admin_create_user():
     if not database:
         return jsonify({'error': 'Database not initialized'}), 500
 
-    payload = request.json or {}
+    payload = (request.get_json(silent=True) or {})
     email = str(payload.get('email') or '').strip().lower()
     display_name = str(payload.get('display_name') or '').strip()
     password = str(payload.get('password') or '').strip()
@@ -1459,7 +1541,7 @@ def admin_update_user(user_id):
     if not existing:
         return jsonify({'error': 'user_not_found'}), 404
 
-    payload = request.json or {}
+    payload = (request.get_json(silent=True) or {})
     updates = {}
     iam_settings = _get_iam_settings()
     protect_last_super = _bool_setting(iam_settings.get('enforce_last_super_admin_protection'), True)
@@ -1506,7 +1588,7 @@ def admin_reset_user_password(user_id):
     if not existing:
         return jsonify({'error': 'user_not_found'}), 404
 
-    payload = request.json or {}
+    payload = (request.get_json(silent=True) or {})
     new_password = str(payload.get('new_password') or '').strip()
     policy_error = _validate_password_against_policy(new_password, str(existing.get('email') or ''))
     if policy_error:
@@ -1545,7 +1627,7 @@ def admin_get_iam_settings():
 def admin_update_iam_settings():
     if not database:
         return jsonify({'error': 'Database not initialized'}), 500
-    payload = request.json or {}
+    payload = (request.get_json(silent=True) or {})
     allowed_keys = set(IAM_SETTINGS_DEFAULTS.keys()) | {'auth_max_failed_attempts', 'auth_lockout_minutes'}
     updates = {k: payload[k] for k in payload.keys() if k in allowed_keys}
     if not updates:
@@ -1598,7 +1680,7 @@ def admin_create_custom_role():
     if not database:
         return jsonify({'error': 'Database not initialized'}), 500
 
-    payload = request.json or {}
+    payload = (request.get_json(silent=True) or {})
     role = _normalize_role_key(payload.get('role') or payload.get('role_key'))
     display_name = str(payload.get('display_name') or role).strip()
     description = str(payload.get('description') or '').strip()
@@ -1640,7 +1722,7 @@ def admin_update_custom_role(role):
     if not existing:
         return jsonify({'error': 'role_not_found'}), 404
 
-    payload = request.json or {}
+    payload = (request.get_json(silent=True) or {})
     updates: dict[str, object] = {}
     if 'display_name' in payload:
         updates['display_name'] = str(payload.get('display_name') or '').strip() or role_u
@@ -1699,7 +1781,7 @@ def admin_put_iam_role_permissions(role):
     if role_u not in role_catalog:
         return jsonify({'error': 'role_not_found'}), 400
 
-    payload = request.json or {}
+    payload = (request.get_json(silent=True) or {})
     incoming = payload.get('permissions')
     if not isinstance(incoming, dict):
         return jsonify({'error': 'permissions object is required'}), 400
@@ -1721,41 +1803,48 @@ def admin_put_iam_role_permissions(role):
 
 # ============== EVENT INGESTION ==============
 
+MAX_EVENT_PAYLOAD_CHARS = 20_000
+
+
+def _text_field(data: dict, key: str, default: str, max_len: int = 255) -> str:
+    value = data.get(key)
+    return (str(value) if isinstance(value, (str, int, float)) else default)[:max_len] or default
+
+
 @app.route('/api/events', methods=['POST'])
 def ingest_event():
     """Ingest event from agent"""
-
-    data = request.json or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"status": "error", "message": "JSON object required"}), 400
+    payload = data.get('payload', '')
+    if not isinstance(payload, str):
+        return jsonify({"status": "error", "message": "payload must be a string"}), 400
+    if not event_processor:
+        return jsonify({"status": "error", "message": "Event processor not initialized"}), 503
 
     try:
-        if not event_processor:
-            return jsonify({"status": "error", "message": "Event processor not initialized"}), 500
-
         event_id = event_processor.process_event(
-            agent_type=data.get('agent_type', 'unknown'),
-            source_host=data.get('source_host', 'unknown'),
-            user=data.get('user', 'unknown'),
-            channel=data.get('channel', 'unknown'),
-            payload=data.get('payload', ''),
-            geo=data.get('geo', {})
+            agent_type=_text_field(data, 'agent_type', 'unknown', 64),
+            source_host=_text_field(data, 'source_host', 'unknown'),
+            user=_text_field(data, 'user', 'unknown'),
+            channel=_text_field(data, 'channel', 'unknown', 64),
+            payload=payload[:MAX_EVENT_PAYLOAD_CHARS],
+            geo=data.get('geo') if isinstance(data.get('geo'), dict) else {},
         )
+    except Exception:
+        log.exception("event ingest failed")
+        return jsonify({"status": "error", "message": "event could not be processed"}), 500
 
-        return jsonify({
-            "status": "success",
-            "event_id": event_id
-        }), 200
-
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 400
+    if event_id:
+        metrics.inc('detections')
+    return jsonify({"status": "success", "event_id": event_id}), 200
 
 
 @app.route('/api/browser/incident', methods=['POST'])
 def create_browser_incident():
     """Create an incident directly from a browser extension detection and send Telegram alert."""
-    data = request.json or {}
+    data = (request.get_json(silent=True) or {})
 
     try:
         from src.incident_store import Event
@@ -1939,7 +2028,7 @@ def create_browser_incident():
             incident.ai_analysis = ai_analysis_dict
             incident.verdict = ai_analysis_dict["verdict"]
         
-        print(f"🚨 BROWSER INCIDENT: {incident.incident_id} - User {user} upload to {host} ({action})")
+        print(f"BROWSER INCIDENT: {incident.incident_id} - User {user} upload to {host} ({action})")
 
         # Broadcast real-time notification to SIEM Console
         try:
@@ -1953,7 +2042,7 @@ def create_browser_incident():
                 "action": action,
                 "risk": avg_risk,
                 "timestamp": datetime.now().isoformat(),
-                "message": f"🚨 {severity.upper()} — {user}@{host}: {pattern_desc[:80]}"
+                "message": f"{severity.upper()} — {user}@{host}: {pattern_desc[:80]}"
             })
         except Exception:
             pass
@@ -1974,9 +2063,9 @@ def create_browser_incident():
                         ),
                         loop
                     )
-                    print(f"📱 BROWSER TELEGRAM ALERT QUEUED: {incident.incident_id}")
+                    print(f"BROWSER TELEGRAM ALERT QUEUED: {incident.incident_id}")
         except Exception as e:
-            print(f"⚠️ Telegram alert failed for browser incident: {scrub_token(e)}")
+            print(f"Telegram alert failed for browser incident: {scrub_token(e)}")
 
         return jsonify({
             "status": "success",
@@ -1987,7 +2076,7 @@ def create_browser_incident():
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        return _server_error(e)
 
 
 # ============== INCIDENT ANALYSIS ==============
@@ -2045,12 +2134,12 @@ def analyze_incident(incident_id):
                         loop
                     )
         except Exception as e:
-            print(f"⚠️ Telegram send failed: {scrub_token(e)}")
+            print(f"Telegram send failed: {scrub_token(e)}")
 
         return jsonify(analysis), 200
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _server_error(e)
 
 
 # ============== INCIDENT MANAGEMENT ==============
@@ -2193,7 +2282,7 @@ def get_security_team():
         members = database.get_security_team(active_only=True)
         return jsonify({"members": members}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _server_error(e)
 
 
 @app.route('/api/incidents/<incident_id>/activity-log', methods=['GET'])
@@ -2205,7 +2294,7 @@ def get_incident_activity_log(incident_id):
         logs = database.get_incident_activity_logs(incident_id)
         return jsonify({"incident_id": incident_id, "logs": logs}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _server_error(e)
 
 
 @app.route('/api/incidents/<incident_id>/activity-log', methods=['POST'])
@@ -2214,7 +2303,7 @@ def add_incident_activity_log(incident_id):
     if not database or not incident_store:
         return jsonify({"error": "Components not initialized"}), 500
 
-    payload = request.json or {}
+    payload = (request.get_json(silent=True) or {})
     stage = str(payload.get('stage') or 'update').strip().lower()
     actor = _actor_from_request('secops_analyst')
     note = str(payload.get('note') or '').strip()
@@ -2243,7 +2332,7 @@ def add_incident_activity_log(incident_id):
         logs = database.get_incident_activity_logs(incident_id)
         return jsonify({"status": "ok", "incident_id": incident_id, "logs": logs}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _server_error(e)
 
 
 @app.route('/api/incidents/<incident_id>/assign', methods=['POST'])
@@ -2252,7 +2341,7 @@ def assign_incident(incident_id):
     if not database or not incident_store:
         return jsonify({"error": "Components not initialized"}), 500
 
-    payload = request.json or {}
+    payload = (request.get_json(silent=True) or {})
     assignee = str(payload.get('assignee') or '').strip()
     actor = _actor_from_request('secops_analyst')
     note = str(payload.get('note') or '').strip()
@@ -2282,7 +2371,7 @@ def assign_incident(incident_id):
 
         return jsonify({"status": "assigned", "incident": updated}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _server_error(e)
 
 
 @app.route('/api/incidents/bulk-action', methods=['POST'])
@@ -2291,7 +2380,7 @@ def bulk_incident_action():
     if not database or not incident_store:
         return jsonify({"error": "Components not initialized"}), 500
 
-    payload = request.json or {}
+    payload = (request.get_json(silent=True) or {})
     action = str(payload.get('action') or '').strip().lower()
     incident_ids = payload.get('incident_ids') if isinstance(payload.get('incident_ids'), list) else []
     actor = _actor_from_request('secops_analyst')
@@ -2478,8 +2567,9 @@ def bulk_incident_action():
                 closed_at=datetime.now().isoformat(),
             )
             updated.append({"incident_id": incident_id, "status": "closed", "classification": classification})
-        except Exception as e:
-            failed.append({"incident_id": incident_id, "error": str(e)})
+        except Exception:
+            log.exception("bulk action failed for %s", incident_id)
+            failed.append({"incident_id": incident_id, "error": "action_failed"})
 
     return jsonify({
         "action": action,
@@ -2502,7 +2592,7 @@ def close_incident(incident_id):
     if not incident:
         return jsonify({"error": "Incident not found"}), 404
 
-    payload = request.json or {}
+    payload = (request.get_json(silent=True) or {})
     actor = _actor_from_request('secops_analyst')
     classification = _normalize_classification(payload.get('classification') or getattr(incident, 'classification', None))
     initial_statement = str(payload.get('initial_statement') or '').strip()
@@ -2548,7 +2638,7 @@ def close_incident(incident_id):
             closed_at=datetime.now().isoformat(),
         )
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _server_error(e)
 
     if not updated:
         return jsonify({"error": "Incident not found"}), 404
@@ -2607,7 +2697,7 @@ def escalate_incident(incident_id):
         error_trace = traceback.format_exc()
         print(f"Escalate error: {e}")
         print(error_trace)
-        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+        return _server_error(e)
 
 
 @app.route('/api/incidents/<incident_id>/raise-ticket', methods=['POST'])
@@ -2616,7 +2706,7 @@ def raise_incident_ticket(incident_id):
     if not incident_store or not database:
         return jsonify({"error": "Components not initialized"}), 500
 
-    payload = request.json or {}
+    payload = (request.get_json(silent=True) or {})
     actor = _actor_from_request('secops_analyst')
     note = str(payload.get('note') or 'Ticket raised by analyst').strip()
 
@@ -2661,7 +2751,7 @@ def reopen_incident(incident_id):
     if not incident_store or not database:
         return jsonify({"error": "Components not initialized"}), 500
 
-    payload = request.json or {}
+    payload = (request.get_json(silent=True) or {})
     actor = _actor_from_request('secops_analyst')
     note = str(payload.get('note') or 'Incident reopened for further investigation').strip()
 
@@ -2688,7 +2778,7 @@ def reopen_incident(incident_id):
 @app.route('/api/events', methods=['GET'])
 def get_events():
     """Get recent events"""
-    limit = request.args.get('limit', 50, type=int)
+    limit = _limit_arg(50, 5000)
     if database:
         events = database.get_all_events(limit=limit)
         return jsonify({
@@ -2725,7 +2815,7 @@ def get_event_by_id(event_id):
 @app.route('/api/scan/file', methods=['POST'])
 def scan_file_endpoint():
     """Scan a file or directory for sensitive data"""
-    data = request.json or {}
+    data = (request.get_json(silent=True) or {})
     path = data.get('path')
 
     if not path:
@@ -2757,13 +2847,13 @@ def scan_file_endpoint():
         }), 200
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _server_error(e)
 
 
 @app.route('/api/scan/text', methods=['POST'])
 def scan_text_endpoint():
     """Scan text content for sensitive data patterns"""
-    data = request.json or {}
+    data = (request.get_json(silent=True) or {})
     text = data.get('text', '')
 
     if not text:
@@ -2783,7 +2873,7 @@ def scan_text_endpoint():
         }), 200
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _server_error(e)
 
 
 @app.route('/api/scan/clipboard', methods=['POST'])
@@ -2802,7 +2892,7 @@ def scan_clipboard_endpoint():
         }), 200
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _server_error(e)
 
 
 # ============== BROWSER EXTENSION ==============
@@ -2811,7 +2901,7 @@ def scan_clipboard_endpoint():
 def scan_browser_upload():
     """Scan file content from browser extension before upload.
     This allows the extension to double-check with the server-side scanner."""
-    data = request.json or {}
+    data = (request.get_json(silent=True) or {})
     text = data.get('content', '')
     file_name = data.get('file_name', 'unknown')
     file_size = data.get('file_size', 0)
@@ -2863,7 +2953,7 @@ def scan_browser_upload():
         }), 200
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _server_error(e)
 
 
 @app.route('/api/scan/browser-file', methods=['POST'])
@@ -2873,7 +2963,7 @@ def scan_browser_file_payload():
     Extraction (true type, OCR, archives) happens once, in memory; built-in detectors and the
     active SIEM regex policies run over the extracted text in the same pass.
     """
-    data = request.json or {}
+    data = (request.get_json(silent=True) or {})
     b64 = data.get('file_content_base64')
     file_name = data.get('file_name', 'upload.bin')
 
@@ -2908,8 +2998,9 @@ def scan_browser_file_payload():
             "finding_count": len(findings),
             "findings": findings,
         }), 200
-    except Exception as e:
-        return jsonify({"inspected": False, "findings": [], "error": str(e)}), 200
+    except Exception:
+        log.exception("browser file scan failed")
+        return jsonify({"inspected": False, "findings": [], "error": "scan_failed"}), 200
 
 
 @app.route('/api/browser/stats', methods=['GET'])
@@ -2938,7 +3029,7 @@ def get_browser_stats():
 def get_scan_results():
     """Get scan results from database"""
     scan_type = request.args.get('type')
-    limit = request.args.get('limit', 50, type=int)
+    limit = _limit_arg(50, 5000)
 
     if not database:
         return jsonify({"total": 0, "results": []}), 200
@@ -3306,130 +3397,222 @@ def get_analytics():
             "generated_at": datetime.now().isoformat(),
         }), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _server_error(e)
 
 
 # ============== DEBUG: ANALYTICS DATA INSPECTION ==============
 
-@app.route('/api/debug/incidents-status', methods=['GET'])
-def debug_incidents_status():
-    """Debug endpoint: Show incident data state for troubleshooting analytics."""
-    if not database:
-        return jsonify({"error": "Database not initialized"}), 500
-
-    try:
-        with database._cursor() as cur:
-            # Check schema columns
-            cur.execute("PRAGMA table_info(incidents)")
-            columns = {col[1]: col for col in cur.fetchall()}
-
-            # Show recent incidents with critical fields
-            cur.execute("""
-                SELECT
-                    incident_id,
-                    user,
-                    assigned_to,
-                    assigned_at,
-                    status,
-                    closed_by,
-                    closed_at,
-                    created_at,
-                    updated_at
-                FROM incidents
-                ORDER BY created_at DESC
-                LIMIT 20
-            """)
-            incidents_data = [dict(row) for row in cur.fetchall()]
-
-            # Count incidents by status
-            cur.execute("""
-                SELECT status, COUNT(*) as count FROM incidents GROUP BY status
-            """)
-            status_counts = {row['status']: row['count'] for row in cur.fetchall()}
-
-            # Count with assigned_at set
-            cur.execute("SELECT COUNT(*) as c FROM incidents WHERE assigned_at IS NOT NULL")
-            assigned_count = cur.fetchone()['c']
-
-            # Count with closed_by set
-            cur.execute("SELECT COUNT(*) as c FROM incidents WHERE closed_by IS NOT NULL")
-            closed_count = cur.fetchone()['c']
-
-            return jsonify({
-                "schema_has_assigned_at": "assigned_at" in columns,
-                "schema_has_closed_by": "closed_by" in columns,
-                "schema_has_closed_at": "closed_at" in columns,
-                "total_incidents": len(incidents_data),
-                "incidents_with_assigned_at": assigned_count,
-                "incidents_with_closed_by": closed_count,
-                "status_breakdown": status_counts,
-                "recent_incidents": incidents_data[:5],
-            }), 200
-    except Exception as e:
-        return jsonify({"error": str(e), "type": type(e).__name__}), 500
-
-
 # ============== FLEET TRACKING ==============
+# Fleet state, managed settings and the command queue live in SQLite so they survive
+# restarts (see src/database_platform.py).
 
-# In-memory fleet registry (survives until server restart)
-fleet_registry = {}
-# In-memory command queue per agent (consumed on check-in)
-fleet_command_queue: dict[str, list[dict]] = {}
+def _fleet_agent_status(last_seen_raw: object | None) -> tuple[str, int | None]:
+    """online (<2 min), idle (<10 min), offline, or pending for agents never seen."""
+    if not last_seen_raw:
+        return 'pending', None
+    try:
+        last_seen = datetime.fromisoformat(str(last_seen_raw).replace('Z', '+00:00'))
+    except ValueError:
+        return 'offline', None
+    now = datetime.now(last_seen.tzinfo) if last_seen.tzinfo else datetime.now()
+    delta = max(0, int((now - last_seen).total_seconds()))
+    return ('online' if delta < 120 else 'idle' if delta < 600 else 'offline'), delta
+
+
+def _fleet_info(agent_id: str) -> dict:
+    return (database.get_fleet_agent(agent_id) if database else None) or {}
+
+
+def _path_agent_allowed(agent_id: str) -> bool:
+    """An agent authenticated with its own key may only act on its own resources."""
+    ident = _agent_identity()
+    return not (ident and ident.method == 'key' and ident.agent_id != agent_id)
+
+
+@app.route('/api/fleet/enroll', methods=['POST'])
+def fleet_enroll():
+    """Exchange the enrollment token for a per-agent key (shown once)."""
+    if not database:
+        return jsonify({"error": "database_unavailable"}), 503
+    if not agent_auth.enrollment_token():
+        return jsonify({"error": "enrollment_disabled",
+                        "message": "Set TRON_AGENT_TOKEN on the API to enable agent enrollment."}), 403
+    if not agent_auth.token_matches(request.headers.get('X-Tron-Agent-Token', '').strip()):
+        return jsonify({"error": "invalid_enrollment_token"}), 401
+
+    data = request.get_json(silent=True) or {}
+    agent_id = str(data.get('agent_id') or '').strip()
+    if not agent_auth.valid_agent_id(agent_id):
+        return jsonify({"error": "invalid_agent_id"}), 400
+
+    key = agent_auth.generate_key()
+    created = database.create_agent_credential(
+        agent_id, agent_auth.hash_key(key), agent_auth.key_prefix(key),
+        agent_type=str(data.get('agent_type') or '')[:64],
+        hostname=str(data.get('hostname') or '')[:255],
+        created_by='enrollment',
+    )
+    if not created:
+        _write_portal_audit('agent_enroll_refused', 'agent', agent_id, 'enrollment',
+                            {"reason": "already_enrolled", "ip": security.client_ip()})
+        return jsonify({"error": "already_enrolled",
+                        "message": "This agent already holds a key. Revoke it in the console to re-enroll."}), 409
+    _write_portal_audit('agent_enrolled', 'agent', agent_id, 'enrollment', {"ip": security.client_ip()})
+    return jsonify({"status": "enrolled", "agent_id": agent_id, "agent_key": key,
+                    "key_prefix": agent_auth.key_prefix(key)}), 201
+
+
+@app.route('/api/fleet/agents/<agent_id>/key/rotate', methods=['POST'])
+def fleet_agent_rotate_key(agent_id):
+    """Agent-initiated key rotation. Requires the agent's current key."""
+    ident = _agent_identity()
+    if not database or not ident or ident.method != 'key' or ident.agent_id != agent_id:
+        return jsonify({"error": "agent_key_required"}), 401
+    key = agent_auth.generate_key()
+    if not database.rotate_agent_credential(agent_id, agent_auth.hash_key(key), agent_auth.key_prefix(key),
+                                            grace_seconds=agent_auth.ROTATION_GRACE_SECONDS):
+        return jsonify({"error": "credential_not_active"}), 409
+    _write_portal_audit('agent_key_rotated', 'agent', agent_id, agent_id, {"ip": security.client_ip()})
+    return jsonify({"status": "rotated", "agent_id": agent_id, "agent_key": key,
+                    "key_prefix": agent_auth.key_prefix(key),
+                    "previous_key_valid_seconds": agent_auth.ROTATION_GRACE_SECONDS}), 200
+
+
+@app.route('/api/fleet/credentials', methods=['GET'])
+def fleet_list_credentials():
+    """Console: agent credential inventory (never includes key material)."""
+    if not database:
+        return jsonify({"credentials": [], "auth_mode": agent_auth.auth_mode()}), 200
+    rows = []
+    for c in database.list_agent_credentials():
+        rows.append({k: c.get(k) for k in (
+            'agent_id', 'key_prefix', 'agent_type', 'hostname', 'created_at', 'created_by',
+            'rotated_at', 'revoked_at', 'revoked_by', 'last_used_at', 'last_ip')})
+    return jsonify({"credentials": rows, "auth_mode": agent_auth.auth_mode(),
+                    "enrollment_enabled": bool(agent_auth.enrollment_token())}), 200
+
+
+@app.route('/api/fleet/agents/<agent_id>/key', methods=['POST'])
+def fleet_issue_agent_key(agent_id):
+    """Console: issue (or re-issue after revocation) a key for an agent. Shown once."""
+    if not database:
+        return jsonify({"error": "database_unavailable"}), 503
+    if not agent_auth.valid_agent_id(agent_id):
+        return jsonify({"error": "invalid_agent_id"}), 400
+    actor = _actor_from_request()
+    key = agent_auth.generate_key()
+    info = _fleet_info(agent_id)
+    if not database.create_agent_credential(agent_id, agent_auth.hash_key(key), agent_auth.key_prefix(key),
+                                            agent_type=str(info.get('agent_type') or ''),
+                                            hostname=str(info.get('hostname') or ''), created_by=actor):
+        return jsonify({"error": "already_enrolled",
+                        "message": "Revoke the current key before issuing a new one, or queue a rotation."}), 409
+    _write_portal_audit('agent_key_issued', 'agent', agent_id, actor, {})
+    return jsonify({"status": "issued", "agent_id": agent_id, "agent_key": key,
+                    "key_prefix": agent_auth.key_prefix(key)}), 201
+
+
+@app.route('/api/fleet/agents/<agent_id>/key', methods=['DELETE'])
+def fleet_revoke_agent_key(agent_id):
+    """Console: revoke an agent's key. The agent must be re-enrolled afterwards."""
+    if not database:
+        return jsonify({"error": "database_unavailable"}), 503
+    actor = _actor_from_request()
+    if not database.revoke_agent_credential(agent_id, actor=actor):
+        return jsonify({"error": "credential_not_found"}), 404
+    _write_portal_audit('agent_key_revoked', 'agent', agent_id, actor, {})
+    return jsonify({"status": "revoked", "agent_id": agent_id}), 200
+
+
+@app.route('/api/fleet/agents/<agent_id>/key/rotation', methods=['POST'])
+def fleet_queue_key_rotation(agent_id):
+    """Console: ask the agent to rotate its key at the next check-in."""
+    if not database:
+        return jsonify({"error": "database_unavailable"}), 503
+    credential = database.get_agent_credential(agent_id)
+    if not credential or credential.get('revoked_at'):
+        return jsonify({"error": "credential_not_active"}), 404
+    actor = _actor_from_request()
+    command = {
+        "command_id": f"CMD-{uuid.uuid4().hex[:10].upper()}",
+        "type": "rotate_key",
+        "requested_by": actor,
+        "created_at": datetime.now().isoformat(),
+    }
+    depth = database.enqueue_fleet_command(agent_id, command)
+    _write_portal_audit('agent_key_rotation_queued', 'agent', agent_id, actor, {"command_id": command["command_id"]})
+    return jsonify({"status": "queued", "agent_id": agent_id, "command": command, "queue_depth": depth}), 200
+
+
+@app.route('/api/fleet/agents/<agent_id>', methods=['DELETE'])
+def fleet_remove_agent(agent_id):
+    """Console: remove a decommissioned agent from the fleet and revoke its key."""
+    if not database:
+        return jsonify({"error": "database_unavailable"}), 503
+    actor = _actor_from_request()
+    removed = database.delete_fleet_agent(agent_id)
+    revoked = database.revoke_agent_credential(agent_id, actor=actor)
+    if not removed and not revoked:
+        return jsonify({"error": "agent_not_found"}), 404
+    _write_portal_audit('agent_removed', 'agent', agent_id, actor, {"key_revoked": revoked})
+    return jsonify({"status": "removed", "agent_id": agent_id, "key_revoked": revoked}), 200
+
 
 @app.route('/api/fleet/checkin', methods=['POST'])
 def fleet_checkin():
     """Agent check-in endpoint — agents call this periodically"""
-    data = request.json or {}
-    agent_id = data.get('agent_id', request.remote_addr)
-    agent_type = data.get('agent_type', 'unknown')
-    hostname = data.get('hostname', 'unknown')
-    os_info = data.get('os', 'unknown')
-    version = data.get('version', '1.0')
-    ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-    user = data.get('user', 'unknown')
+    data = request.get_json(silent=True) or {}
+    agent_id = _bound_agent_id(data.get('agent_id')) or security.client_ip()
+    if not agent_auth.valid_agent_id(agent_id):
+        return jsonify({"error": "invalid_agent_id"}), 400
+    if not database:
+        return jsonify({"status": "ok", "server_time": datetime.now().isoformat(), "command": None}), 200
 
-    fleet_registry[agent_id] = {
-        "agent_id": agent_id,
-        "agent_type": agent_type,
-        "hostname": hostname,
-        "os": os_info,
-        "version": version,
-        "ip": ip,
-        "user": user,
-        "last_seen": datetime.now().isoformat(),
-        "status": "online",
-        "scans_reported": data.get('scans_reported', 0),
-        "incidents_reported": data.get('incidents_reported', 0),
-        "meta": data.get('meta', {}) if isinstance(data.get('meta'), dict) else {},
-    }
-
-    queued = fleet_command_queue.get(agent_id) or []
-    command = queued.pop(0) if queued else None
-    if queued:
-        fleet_command_queue[agent_id] = queued
-    else:
-        fleet_command_queue.pop(agent_id, None)
-
+    meta = data.get('meta') if isinstance(data.get('meta'), dict) else {}
+    meta.pop('managed_settings', None)  # server-owned, never accepted from the agent
+    database.record_fleet_checkin(
+        agent_id=agent_id,
+        agent_type=str(data.get('agent_type') or 'unknown')[:64],
+        hostname=str(data.get('hostname') or 'unknown')[:255],
+        os_info=str(data.get('os') or 'unknown')[:128],
+        version=str(data.get('version') or '1.0')[:32],
+        ip=security.client_ip(),
+        user=str(data.get('user') or 'unknown')[:255],
+        scans=data.get('scans_reported') if isinstance(data.get('scans_reported'), int) else 0,
+        incidents=data.get('incidents_reported') if isinstance(data.get('incidents_reported'), int) else 0,
+        meta=meta,
+    )
+    ident = _agent_identity()
     return jsonify({
         "status": "ok",
         "server_time": datetime.now().isoformat(),
-        "command": command,
+        "command": database.pop_fleet_command(agent_id),
+        "auth": ident.method if ident else "open",
     }), 200
 
 
 @app.route('/api/fleet/status', methods=['GET'])
 def fleet_status():
     """Get all fleet agent statuses"""
-    now = datetime.now()
     agents = []
-    for agent_id, info in fleet_registry.items():
-        last_seen = datetime.fromisoformat(info["last_seen"])
-        delta = (now - last_seen).total_seconds()
-        status = "online" if delta < 120 else "idle" if delta < 600 else "offline"
-        agents.append({**info, "status": status, "last_seen_ago": int(delta)})
+    credentials = {c['agent_id']: c for c in database.list_agent_credentials()} if database else {}
+    for info in (database.list_fleet_agents() if database else []):
+        status, delta = _fleet_agent_status(info.get('last_seen'))
+        meta = dict(info.get('meta') or {})
+        meta['managed_settings'] = info.get('managed_settings') or {}
+        cred = credentials.get(info['agent_id'])
+        agents.append({
+            **{k: info.get(k) for k in ('agent_id', 'agent_type', 'hostname', 'os', 'version', 'ip', 'user',
+                                        'last_seen', 'scans_reported', 'incidents_reported')},
+            "meta": meta,
+            "status": status,
+            "last_seen_ago": delta if delta is not None else -1,
+            "credential": ("revoked" if cred.get('revoked_at') else "active") if cred else "none",
+            "key_prefix": cred.get('key_prefix') if cred else None,
+        })
 
-    # Sort: online first, then by last_seen
-    agents.sort(key=lambda a: (0 if a["status"] == "online" else 1 if a["status"] == "idle" else 2, a["last_seen_ago"]))
+    order = {"online": 0, "idle": 1, "offline": 2, "pending": 3}
+    agents.sort(key=lambda a: (order.get(a["status"], 9), a["last_seen_ago"]))
 
     return jsonify({
         "total": len(agents),
@@ -3437,6 +3620,7 @@ def fleet_status():
         "idle": sum(1 for a in agents if a["status"] == "idle"),
         "offline": sum(1 for a in agents if a["status"] == "offline"),
         "agents": agents,
+        "auth_mode": agent_auth.auth_mode(),
     }), 200
 
 
@@ -3446,11 +3630,11 @@ def fleet_agent_logs(agent_id):
     if not database:
         return jsonify({"logs": [], "events": [], "incidents": []}), 200
 
-    info = fleet_registry.get(agent_id, {})
+    info = _fleet_info(agent_id)
     hostname = info.get('hostname')
     user = info.get('user')
     agent_type = info.get('agent_type')
-    limit = request.args.get('limit', 200, type=int)
+    limit = _limit_arg(200, 1000)
 
     logs = database.get_agent_scan_history(hostname or agent_id, limit=limit, agent_id=agent_id, user=user)
     events = database.get_events_for_agent(agent_id=agent_id, hostname=hostname, user=user, agent_type=agent_type, limit=limit)
@@ -3465,11 +3649,10 @@ def fleet_agent_downloads(agent_id):
     if not database:
         return jsonify({"downloads": []}), 200
 
-    info = fleet_registry.get(agent_id, {})
+    info = _fleet_info(agent_id)
     hostname = info.get('hostname')
     user = info.get('user')
-    limit = request.args.get('limit', 200, type=int)
-    downloads = database.get_agent_downloads(hostname or agent_id, limit=limit, agent_id=agent_id, user=user)
+    downloads = database.get_agent_downloads(hostname or agent_id, limit=_limit_arg(200, 1000), agent_id=agent_id, user=user)
 
     return jsonify({"downloads": downloads}), 200
 
@@ -3479,9 +3662,8 @@ def fleet_agent_operational(agent_id):
     """Get operational logs for an agent."""
     if not database:
         return jsonify({"logs": []}), 200
-    limit = request.args.get('limit', 200, type=int)
-    logs = database.get_operational_logs(agent_id, limit=limit)
-    return jsonify({"logs": logs}), 200
+    logs = database.get_operational_logs(agent_id, limit=_limit_arg(200, 1000))
+    return jsonify({"logs": logs, "commands": database.list_fleet_commands(agent_id)}), 200
 
 
 @app.route('/api/fleet/agents/<agent_id>/operational', methods=['POST'])
@@ -3489,10 +3671,12 @@ def fleet_add_operational(agent_id):
     """Store operational log entry from extension/agent."""
     if not database:
         return jsonify({"error": "Database not configured"}), 500
+    if not _path_agent_allowed(agent_id):
+        return jsonify({"error": "agent_mismatch"}), 403
 
-    data = request.json or {}
-    event_type = data.get('event_type', 'event')
-    message = data.get('message', '')
+    data = request.get_json(silent=True) or {}
+    event_type = str(data.get('event_type') or 'event')[:64]
+    message = str(data.get('message') or '')[:2000]
     details = data.get('details', {}) if isinstance(data.get('details'), dict) else {}
     database.add_operational_log(agent_id, event_type, message, details)
     return jsonify({"status": "ok"}), 200
@@ -3500,10 +3684,8 @@ def fleet_add_operational(agent_id):
 
 @app.route('/api/fleet/agents/<agent_id>/policy', methods=['GET'])
 def fleet_agent_policy_get(agent_id):
-    """Get managed policy knobs for an agent (in-memory)."""
-    meta = (fleet_registry.get(agent_id) or {}).get('meta', {})
-    managed = meta.get('managed_settings', {}) if isinstance(meta, dict) else {}
-    managed = _normalize_managed_extension_settings(managed)
+    """Get managed policy knobs for an agent."""
+    managed = _normalize_managed_extension_settings(_fleet_info(agent_id).get('managed_settings') or {})
     return jsonify({
         "agent_id": agent_id,
         "managed_settings": managed
@@ -3512,33 +3694,18 @@ def fleet_agent_policy_get(agent_id):
 
 @app.route('/api/fleet/agents/<agent_id>/policy', methods=['POST'])
 def fleet_agent_policy_set(agent_id):
-    """Set managed policy knobs for an agent (in-memory)."""
-    data = request.json or {}
+    """Set managed policy knobs for an agent (persisted)."""
+    if not database:
+        return jsonify({"error": "database_unavailable"}), 503
+    if not agent_auth.valid_agent_id(agent_id):
+        return jsonify({"error": "invalid_agent_id"}), 400
+    data = request.get_json(silent=True) or {}
     incoming = data.get('managed_settings', {}) if isinstance(data.get('managed_settings'), dict) else {}
 
-    existing = fleet_registry.get(agent_id, {
-        "agent_id": agent_id,
-        "agent_type": "browser_extension",
-        "hostname": agent_id,
-        "os": "unknown",
-        "version": "1.0",
-        "ip": request.remote_addr,
-        "user": "unknown",
-        "last_seen": datetime.now().isoformat(),
-        "status": "online",
-        "scans_reported": 0,
-        "incidents_reported": 0,
-        "meta": {},
-    })
-
-    meta = existing.get('meta', {}) if isinstance(existing.get('meta'), dict) else {}
-    managed = meta.get('managed_settings', {}) if isinstance(meta.get('managed_settings'), dict) else {}
-    merged = dict(managed)
+    merged = dict(_fleet_info(agent_id).get('managed_settings') or {})
     merged.update(incoming)
     managed = _normalize_managed_extension_settings(merged)
-    meta['managed_settings'] = managed
-    existing['meta'] = meta
-    fleet_registry[agent_id] = existing
+    database.set_fleet_managed_settings(agent_id, managed, ip=None)
 
     return jsonify({"status": "ok", "agent_id": agent_id, "managed_settings": managed}), 200
 
@@ -3551,7 +3718,7 @@ def fleet_agent_upgrade(agent_id):
     target_version. Agents verify the signature against their pinned TRON_UPDATE_PUBKEY
     before executing anything; arbitrary install commands are not accepted.
     """
-    data = request.json or {}
+    data = (request.get_json(silent=True) or {})
     try:
         upgrade = validate_upgrade_request(data)
     except UpgradeRejected as e:
@@ -3569,10 +3736,9 @@ def fleet_agent_upgrade(agent_id):
         "created_at": datetime.now().isoformat(),
     }
 
-    queue = fleet_command_queue.get(agent_id) or []
-    queue.append(command)
-    # Keep only latest 20 queued commands per agent
-    fleet_command_queue[agent_id] = queue[-20:]
+    if not database:
+        return jsonify({"error": "database_unavailable"}), 503
+    queue_depth = database.enqueue_fleet_command(agent_id, command)
 
     if database:
         try:
@@ -3594,7 +3760,7 @@ def fleet_agent_upgrade(agent_id):
         "status": "queued",
         "agent_id": agent_id,
         "command": command,
-        "queue_depth": len(fleet_command_queue.get(agent_id) or []),
+        "queue_depth": queue_depth,
     }), 200
 
 
@@ -3846,79 +4012,90 @@ def incident_user_analytics(incident_id):
     }), 200
 
 
+def _artifacts_root() -> Path:
+    base = Path(database.db_path).parent if database else Path(os.getcwd()) / 'data'
+    return base / 'artifacts'
+
+
+def _store_artifact_bytes(raw: bytes, artifact_id: str, user_value: object, file_name: str) -> str:
+    """Write an artifact sealed with the data key; returns its path."""
+    ext = re.sub(r'[^A-Za-z0-9.]', '', os.path.splitext(os.path.basename(str(file_name)))[1])[:16] or '.bin'
+    directory = _artifacts_root() / 'by_user' / _safe_user_folder(user_value)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{artifact_id}{ext}"
+    sealed = database.cipher.seal_bytes(raw, aad=artifact_id.encode()) if database else raw
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'wb') as fh:
+        fh.write(sealed)
+    return str(path)
+
+
+def _load_artifact(artifact_id: str):
+    """(artifact row, plaintext bytes) or (None, error response)."""
+    if not database:
+        return None, (jsonify({"error": "Database not configured"}), 500)
+    art = database.get_upload_artifact(artifact_id)
+    if not art:
+        return None, (jsonify({"error": "Artifact not found"}), 404)
+    content_path = art.get('content_path')
+    if not content_path or not os.path.isfile(content_path):
+        return None, (jsonify({"error": "Artifact file missing"}), 404)
+    try:
+        with open(content_path, 'rb') as fh:
+            raw = database.cipher.open_bytes(fh.read(), aad=artifact_id.encode())
+    except Exception:
+        log.exception("artifact %s could not be read", artifact_id)
+        return None, (jsonify({"error": "Artifact could not be read"}), 500)
+    return art, raw
+
+
+def _send_artifact(art: dict, raw: bytes, inline: bool):
+    declared = str(art.get('file_type') or '').split(';')[0].strip().lower()
+    # Only render types that cannot execute script; everything else downloads.
+    inline_ok = inline and declared in security.INLINE_SAFE_TYPES
+    name = os.path.basename(str(art.get('file_name') or '')) or f"{art.get('artifact_id')}.bin"
+    response = send_file(
+        io.BytesIO(raw),
+        as_attachment=not inline_ok,
+        download_name=name,
+        mimetype=declared if inline_ok else 'application/octet-stream',
+    )
+    response.headers['Content-Security-Policy'] = "default-src 'none'; sandbox"
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    _write_portal_audit('artifact_accessed', 'artifact', str(art.get('artifact_id')), _actor_from_request(),
+                        {"mode": "view" if inline_ok else "download"})
+    return response
+
+
 @app.route('/api/fleet/artifacts/<artifact_id>/content', methods=['GET'])
 def fleet_artifact_content(artifact_id):
     """Get artifact content for incident evidence view."""
-    if not database:
-        return jsonify({"error": "Database not configured"}), 500
-
-    art = database.get_upload_artifact(artifact_id)
-    if not art:
-        return jsonify({"error": "Artifact not found"}), 404
-
-    content_path = art.get('content_path')
-    if not content_path or not os.path.exists(content_path):
-        return jsonify({"error": "Artifact file missing"}), 404
-
+    art, raw = _load_artifact(artifact_id)
+    if art is None:
+        return raw
+    _write_portal_audit('artifact_accessed', 'artifact', artifact_id, _actor_from_request(), {"mode": "content"})
     try:
-        with open(content_path, 'rb') as fh:
-            raw = fh.read()
-        try:
-            return jsonify({"artifact_id": artifact_id, "content_type": "text", "content": raw.decode('utf-8')}), 200
-        except Exception:
-            return jsonify({"artifact_id": artifact_id, "content_type": "base64", "content_base64": base64.b64encode(raw).decode('utf-8')}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"artifact_id": artifact_id, "content_type": "text", "content": raw.decode('utf-8')}), 200
+    except UnicodeDecodeError:
+        return jsonify({"artifact_id": artifact_id, "content_type": "base64", "content_base64": base64.b64encode(raw).decode('utf-8')}), 200
 
 
 @app.route('/api/fleet/artifacts/<artifact_id>/download', methods=['GET'])
 def fleet_artifact_download(artifact_id):
     """Download raw artifact file for incident evidence."""
-    if not database:
-        return jsonify({"error": "Database not configured"}), 500
-
-    art = database.get_upload_artifact(artifact_id)
-    if not art:
-        return jsonify({"error": "Artifact not found"}), 404
-
-    content_path = art.get('content_path')
-    if not content_path or not os.path.exists(content_path):
-        return jsonify({"error": "Artifact file missing"}), 404
-
-    try:
-        return send_file(
-            content_path,
-            as_attachment=True,
-            download_name=art.get('file_name') or f"{artifact_id}.bin",
-            mimetype=art.get('file_type') or 'application/octet-stream'
-        )
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    art, raw = _load_artifact(artifact_id)
+    if art is None:
+        return raw
+    return _send_artifact(art, raw, inline=False)
 
 
 @app.route('/api/fleet/artifacts/<artifact_id>/view', methods=['GET'])
 def fleet_artifact_view(artifact_id):
-    """View artifact inline in browser when possible."""
-    if not database:
-        return jsonify({"error": "Database not configured"}), 500
-
-    art = database.get_upload_artifact(artifact_id)
-    if not art:
-        return jsonify({"error": "Artifact not found"}), 404
-
-    content_path = art.get('content_path')
-    if not content_path or not os.path.exists(content_path):
-        return jsonify({"error": "Artifact file missing"}), 404
-
-    try:
-        return send_file(
-            content_path,
-            as_attachment=False,
-            download_name=art.get('file_name') or f"{artifact_id}.bin",
-            mimetype=art.get('file_type') or 'application/octet-stream'
-        )
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    """View artifact inline in browser when the type is safe to render."""
+    art, raw = _load_artifact(artifact_id)
+    if art is None:
+        return raw
+    return _send_artifact(art, raw, inline=True)
 
 
 @app.route('/api/scan/report', methods=['POST'])
@@ -3927,7 +4104,7 @@ def ingest_scan_report():
     if not database:
         return jsonify({"error": "Database not configured"}), 500
 
-    data = request.json or {}
+    data = (request.get_json(silent=True) or {})
     try:
         database.add_scan_result(
             scan_type=data.get('scan_type', 'web_upload'),
@@ -3939,11 +4116,11 @@ def ingest_scan_report():
             file_size=data.get('file_size'),
             user=data.get('user'),
             host=data.get('host'),
-            agent_id=data.get('agent_id'),
+            agent_id=_bound_agent_id(data.get('agent_id')) or None,
         )
         return jsonify({"status": "ok"}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _server_error(e)
 
 
 @app.route('/api/browser/artifact', methods=['POST'])
@@ -3952,7 +4129,7 @@ def upload_browser_artifact_json():
     if not database:
         return jsonify({"error": "Database not configured"}), 500
 
-    data = request.json or {}
+    data = (request.get_json(silent=True) or {})
     content_b64 = data.get('content_base64')
     if not content_b64:
         return jsonify({"error": "content_base64 is required"}), 400
@@ -3962,20 +4139,15 @@ def upload_browser_artifact_json():
         artifact_id = f"ART-{uuid.uuid4().hex[:10].upper()}"
         user_value = data.get('user', 'browser_user')
         file_name = data.get('file_name', 'upload.bin')
-        ext = os.path.splitext(file_name)[1] or '.bin'
-        artifacts_dir = os.path.join(os.getcwd(), 'data', 'artifacts', 'by_user', _safe_user_folder(user_value))
-        os.makedirs(artifacts_dir, exist_ok=True)
-        content_path = os.path.join(artifacts_dir, f"{artifact_id}{ext}")
+        content_path = _store_artifact_bytes(raw, artifact_id, user_value, file_name)
 
         source_host = data.get('source_host', '')
         hostname = data.get('hostname', '') or source_host
-        with open(content_path, 'wb') as fh:
-            fh.write(raw)
 
         sha = hashlib.sha256(raw).hexdigest()
         database.add_upload_artifact(
             artifact_id=artifact_id,
-            agent_id=data.get('agent_id', ''),
+            agent_id=_bound_agent_id(data.get('agent_id')),
             scan_id=data.get('scan_id', ''),
             hostname=hostname,
             user=user_value,
@@ -3991,7 +4163,7 @@ def upload_browser_artifact_json():
         )
         return jsonify({"status": "stored", "artifact_id": artifact_id}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _server_error(e)
 
 
 @app.route('/api/browser/artifact/raw', methods=['POST'])
@@ -4010,15 +4182,10 @@ def upload_browser_artifact_raw():
 
         user_value = request.form.get('user', 'browser_user')
         file_name = request.form.get('file_name', file.filename or 'upload.bin')
-        ext = os.path.splitext(file_name)[1] or '.bin'
-        artifacts_dir = os.path.join(os.getcwd(), 'data', 'artifacts', 'by_user', _safe_user_folder(user_value))
-        os.makedirs(artifacts_dir, exist_ok=True)
-        content_path = os.path.join(artifacts_dir, f"{artifact_id}{ext}")
+        content_path = _store_artifact_bytes(raw, artifact_id, user_value, file_name)
 
         source_host = request.form.get('source_host', '')
         hostname = request.form.get('hostname', '') or source_host
-        with open(content_path, 'wb') as fh:
-            fh.write(raw)
 
         sha = hashlib.sha256(raw).hexdigest()
         findings_raw = request.form.get('findings', '[]')
@@ -4029,7 +4196,7 @@ def upload_browser_artifact_raw():
 
         database.add_upload_artifact(
             artifact_id=artifact_id,
-            agent_id=request.form.get('agent_id', ''),
+            agent_id=_bound_agent_id(request.form.get('agent_id')),
             scan_id=request.form.get('scan_id', ''),
             hostname=hostname,
             user=user_value,
@@ -4045,63 +4212,100 @@ def upload_browser_artifact_raw():
         )
         return jsonify({"status": "stored", "artifact_id": artifact_id}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _server_error(e)
 
 
 # ============== SCREENSHOTS ==============
+# Stored in SQLite with the image sealed by the data key; pruned by the retention job.
 
-screenshots_store = []  # In-memory for simplicity (last 100)
+MAX_SCREENSHOT_B64 = 8 * 1024 * 1024
+
 
 @app.route('/api/screenshots', methods=['POST'])
 def upload_screenshot():
     """Receive a screenshot from the browser extension"""
-    data = request.json or {}
-    entry = {
-        "id": f"SS-{uuid.uuid4().hex[:8].upper()}",
-        "timestamp": datetime.now().isoformat(),
-        "domain": data.get("domain", "unknown"),
-        "user": data.get("user", "browser_user"),
-        "incident_type": data.get("incident_type", "violation"),
-        "severity": data.get("severity", "medium"),
-        "image_data": data.get("image_data", ""),  # base64
-        "url": data.get("url", ""),
-        "findings_summary": data.get("findings_summary", ""),
-    }
-    screenshots_store.insert(0, entry)
-    if len(screenshots_store) > 100:
-        screenshots_store[:] = screenshots_store[:100]
-
-    return jsonify({"status": "stored", "id": entry["id"]}), 200
+    if not database:
+        return jsonify({"error": "database_unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    image_data = str(data.get("image_data") or "")
+    if len(image_data) > MAX_SCREENSHOT_B64:
+        return jsonify({"error": "screenshot_too_large"}), 413
+    screenshot_id = database.add_screenshot({
+        "agent_id": _bound_agent_id(data.get("agent_id")) or None,
+        "domain": str(data.get("domain") or "unknown")[:255],
+        "user": str(data.get("user") or "browser_user")[:255],
+        "incident_type": str(data.get("incident_type") or "violation")[:64],
+        "severity": str(data.get("severity") or "medium")[:16],
+        "image_data": image_data,
+        "url": str(data.get("url") or "")[:2048],
+        "findings_summary": str(data.get("findings_summary") or "")[:4000],
+    })
+    return jsonify({"status": "stored", "id": screenshot_id}), 200
 
 
 @app.route('/api/screenshots', methods=['GET'])
 def get_screenshots():
     """Get recent screenshots (without image data for list view)"""
-    limit = request.args.get('limit', 20, type=int)
-    results = []
-    for ss in screenshots_store[:limit]:
-        results.append({k: v for k, v in ss.items() if k != "image_data"})
-    return jsonify({"screenshots": results}), 200
+    if not database:
+        return jsonify({"screenshots": []}), 200
+    return jsonify({"screenshots": database.list_screenshots(_limit_arg(20, 200))}), 200
 
 
 @app.route('/api/screenshots/<ss_id>', methods=['GET'])
 def get_screenshot(ss_id):
     """Get a specific screenshot with full image data"""
-    for ss in screenshots_store:
-        if ss["id"] == ss_id:
-            return jsonify(ss), 200
-    return jsonify({"error": "Screenshot not found"}), 404
+    shot = database.get_screenshot(ss_id) if database else None
+    if not shot:
+        return jsonify({"error": "Screenshot not found"}), 404
+    return jsonify(shot), 200
 
 
 # ============== REAL-TIME SSE STREAM ==============
+# EventSource cannot send an Authorization header, so the console first exchanges its
+# session for a single-purpose ticket (60 s lifetime) and opens the stream with it.
 
 notification_queues = []
+STREAM_TICKET_TTL_SECONDS = 60
+MAX_STREAM_CLIENTS = int(os.getenv('TRON_MAX_STREAM_CLIENTS', '32'))
+
+
+def _stream_serializer() -> URLSafeTimedSerializer:
+    return URLSafeTimedSerializer(AUTH_SECRET, salt='tron-stream-ticket-v1')
+
+
+@app.route('/api/stream/ticket', methods=['POST'])
+def event_stream_ticket():
+    """Issue a short-lived ticket for /api/stream (requires dashboard.view)."""
+    ticket = _stream_serializer().dumps({'sid': g.current_session_id, 'uid': g.current_user.get('user_id')})
+    return jsonify({"ticket": ticket, "expires_in": STREAM_TICKET_TTL_SECONDS}), 200
+
+
+def _stream_ticket_valid(ticket: str) -> bool:
+    try:
+        claims = _stream_serializer().loads(ticket, max_age=STREAM_TICKET_TTL_SECONDS)
+    except (BadSignature, SignatureExpired):
+        return False
+    if not database or not isinstance(claims, dict):
+        return False
+    session = database.get_auth_session(str(claims.get('sid') or ''))
+    if not session or session.get('revoked_at') or str(session.get('user_id')) != str(claims.get('uid')):
+        return False
+    user = database.get_app_user_by_id(str(claims.get('uid') or ''))
+    if not user or not user.get('is_active'):
+        return False
+    return _has_permission(str(user.get('role') or 'VIEWER').upper(), 'dashboard.view')
+
 
 @app.route('/api/stream', methods=['GET'])
 def event_stream():
     """Server-Sent Events stream for real-time notifications"""
+    if not _stream_ticket_valid(request.args.get('ticket', '')):
+        return jsonify({'error': 'stream_ticket_required'}), 401
+    if len(notification_queues) >= MAX_STREAM_CLIENTS:
+        return jsonify({'error': 'too_many_stream_clients'}), 503
+
     def generate():
-        q = queue.Queue()
+        q = queue.Queue(maxsize=1000)
         notification_queues.append(q)
         try:
             # Send initial connection event
@@ -4113,8 +4317,11 @@ def event_stream():
                 except queue.Empty:
                     # Send heartbeat to keep connection alive
                     yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
-        except GeneratorExit:
-            notification_queues.remove(q)
+        finally:
+            try:
+                notification_queues.remove(q)
+            except ValueError:
+                pass
 
     return app.response_class(
         response=generate(),  # type: ignore
@@ -4197,12 +4404,10 @@ def sync_policies():
             "window": p.get("threshold_window_mins", 60)
         })
         
-    agent_id = str(request.args.get('agent_id') or '').strip()
+    agent_id = _bound_agent_id(request.args.get('agent_id'))
     managed_settings = _normalize_managed_extension_settings({})
     if agent_id:
-        meta = (fleet_registry.get(agent_id) or {}).get('meta', {})
-        managed = meta.get('managed_settings', {}) if isinstance(meta, dict) else {}
-        managed_settings = _normalize_managed_extension_settings(managed)
+        managed_settings = _normalize_managed_extension_settings(_fleet_info(agent_id).get('managed_settings') or {})
 
     return jsonify({
         "patterns": patterns,
@@ -4418,7 +4623,7 @@ def create_exception():
     if not database:
         return jsonify({'error': 'Database not configured'}), 500
 
-    payload = request.json or {}
+    payload = (request.get_json(silent=True) or {})
     normalized = _normalize_exception_payload(payload)
     actor = _actor_from_request('admin')
     normalized['actor'] = actor
@@ -4433,7 +4638,7 @@ def create_exception():
         exception_id = database.add_exception(**normalized)
         return jsonify({'status': 'success', 'exception_id': exception_id}), 201
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _server_error(e)
 
 
 @app.route('/api/exceptions/<exception_id>', methods=['PUT', 'PATCH'])
@@ -4442,7 +4647,7 @@ def update_exception(exception_id):
     if not database:
         return jsonify({'error': 'Database not configured'}), 500
 
-    payload = request.json or {}
+    payload = (request.get_json(silent=True) or {})
     normalized = _normalize_exception_payload(payload)
     if normalized['scope_type'] == 'policy' and not (normalized['policy_id'] or normalized.get('policy_ids')):
         return jsonify({'error': 'policy_id or policy_ids is required for policy scope'}), 400
@@ -4456,7 +4661,7 @@ def update_exception(exception_id):
             return jsonify({'status': 'success'}), 200
         return jsonify({'error': 'Failed to update or no changes'}), 400
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _server_error(e)
 
 
 @app.route('/api/exceptions/<exception_id>', methods=['DELETE'])
@@ -4475,7 +4680,7 @@ def delete_exception(exception_id):
         database.delete_exception(exception_id)
         return jsonify({'status': 'success'}), 200
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _server_error(e)
 
 # ============== AI POLICY LAB ==============
 
@@ -4522,7 +4727,7 @@ def generate_rule():
     if not ai_analyzer:
         return jsonify({"error": "AI analyzer not configured"}), 500
     
-    data = request.json or {}
+    data = (request.get_json(silent=True) or {})
     prompt = data.get('prompt', '').strip()
     
     if not prompt:
@@ -4635,12 +4840,12 @@ def generate_rule():
         }), 200
 
     except Exception as e:
-        return jsonify({"error": f"Failed to generate rule: {str(e)}"}), 500
+        return _server_error(e, "Failed to generate rule")
 
 @app.route('/api/lab/test_rule', methods=['POST'])
 def test_rule():
     """Test a generated rule against sample input"""
-    data = request.json or {}
+    data = (request.get_json(silent=True) or {})
     rule = data.get('rule', {})
     test_input = data.get('input', '').strip()
     
@@ -4700,7 +4905,7 @@ def test_rule():
         }), 200
         
     except Exception as e:
-        return jsonify({"error": f"Test failed: {str(e)}"}), 500
+        return _server_error(e, "Test failed")
 
 @app.route('/api/policies', methods=['POST'])
 def create_policy():
@@ -4708,7 +4913,7 @@ def create_policy():
     if not database:
         return jsonify({"error": "Database not configured"}), 500
         
-    data = request.json or {}
+    data = (request.get_json(silent=True) or {})
     name = data.get('name')
     if not name:
         return jsonify({"error": "Name is required"}), 400
@@ -4789,7 +4994,7 @@ def create_policy():
             rules_engine.invalidate()
         return jsonify({"status": "success", "policy_id": policy_id}), 201
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _server_error(e)
 
 @app.route('/api/policies/<policy_id>', methods=['PUT', 'PATCH'])
 def update_policy(policy_id):
@@ -4797,7 +5002,7 @@ def update_policy(policy_id):
     if not database:
         return jsonify({"error": "Database not configured"}), 500
         
-    data = request.json or {}
+    data = (request.get_json(silent=True) or {})
     rule_data = data.get('rule_data') if isinstance(data.get('rule_data'), dict) else None
     detector = str(data.get('detector') or (rule_data or {}).get('detector') or '').strip()
     if detector:
@@ -4814,7 +5019,7 @@ def update_policy(policy_id):
             return jsonify({"status": "success"}), 200
         return jsonify({"error": "Failed to update or no changes"}), 400
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _server_error(e)
 
 @app.route('/api/policies/<policy_id>', methods=['DELETE'])
 def delete_policy(policy_id):
@@ -4834,14 +5039,14 @@ def delete_policy(policy_id):
             rules_engine.invalidate()
         return jsonify({"status": "success"}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _server_error(e)
 
 # ============== AUDIT LOG ==============
 
 @app.route('/api/audit', methods=['GET'])
 def get_audit_log():
     """Get audit log entries"""
-    limit = request.args.get('limit', 50, type=int)
+    limit = _limit_arg(50, 5000)
     actor = str(request.args.get('actor', '') or '').strip() or None
     action = str(request.args.get('action', '') or '').strip() or None
     query = str(request.args.get('query', '') or '').strip() or None
@@ -4880,19 +5085,22 @@ def get_stats():
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    """Health check endpoint"""
+    """Liveness/readiness probe. 503 when the database is unreachable.
 
-    db_status = "ok"
-    try:
-        if database:
-            database.stats()  # Quick DB check
-    except Exception:
-        db_status = "error"
+    Unauthenticated, so it reports component state only: no version, paths or configuration.
+    """
+    db_status = "unconfigured"
+    if database:
+        try:
+            database.stats()
+            db_status = "ok"
+        except Exception:
+            log.exception("health check: database unavailable")
+            db_status = "error"
 
+    healthy = db_status == "ok"
     return jsonify({
-        "status": "healthy",
-        "version": "2.0.0",
-        "storage": "sqlite_persistent",
+        "status": "healthy" if healthy else "unhealthy",
         "components": {
             "incident_store": "ok" if incident_store else "unconfigured",
             "rules_engine": "ok" if rules_engine else "unconfigured",
@@ -4902,24 +5110,59 @@ def health_check():
             "slack": "ok" if escalation_engine and escalation_engine.slack_webhook else "unconfigured",
             "gemini_ai": "ok" if ai_analyzer and ai_analyzer.api_key else "unconfigured",
         }
-    }), 200
+    }), 200 if healthy else 503
 
 
 # ============== ERROR HANDLERS ==============
+
+@app.errorhandler(400)
+def bad_request(_error):
+    return jsonify({"error": "Bad request"}), 400
+
 
 @app.errorhandler(404)
 def not_found(_error):
     return jsonify({"error": "Not found"}), 404
 
 
+@app.errorhandler(405)
+def method_not_allowed(_error):
+    return jsonify({"error": "Method not allowed"}), 405
+
+
+@app.errorhandler(413)
+def payload_too_large(_error):
+    return jsonify({"error": "Request body too large"}), 413
+
+
+@app.errorhandler(415)
+def unsupported_media_type(_error):
+    return jsonify({"error": "Unsupported media type; send application/json"}), 415
+
+
 @app.errorhandler(500)
 def internal_error(_error):
-    return jsonify({"error": "Internal server error"}), 500
+    return jsonify({"error": "Internal server error", "request_id": getattr(g, 'request_id', None)}), 500
 
 
-if __name__ == '__main__':
-    app.run(
-        host=Config.FLASK_HOST,
-        port=Config.FLASK_PORT,
-        debug=Config.DEBUG
-    )
+@app.errorhandler(Exception)
+def unhandled_exception(error):
+    """Last resort: log the traceback server-side, return an opaque error to the client."""
+    from werkzeug.exceptions import HTTPException
+    if isinstance(error, HTTPException):
+        return jsonify({"error": error.name}), error.code or 500
+    log.exception("unhandled error on %s %s", request.method, request.path)
+    return jsonify({"error": "Internal server error", "request_id": getattr(g, 'request_id', None)}), 500
+
+
+@app.after_request
+def _observe_request(response):
+    started = getattr(g, 'request_started', None)
+    if started is not None and request.path.startswith('/api/'):
+        metrics.observe_request(request.path, response.status_code, time.monotonic() - started)
+    return response
+
+
+from src.routes_platform import bp as _platform_bp  # noqa: E402  (needs the helpers above)
+
+app.register_blueprint(_platform_bp)

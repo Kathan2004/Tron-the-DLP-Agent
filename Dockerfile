@@ -1,28 +1,35 @@
-FROM python:3.11-slim
+# Tron DLP API
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    FLASK_HOST=0.0.0.0 \
+    FLASK_PORT=5001
 
 WORKDIR /app
 
-# System dependencies: curl for the healthcheck, tesseract for OCR of images and
-# scanned PDFs (PDF pages are rendered by pypdfium2, so poppler is not needed).
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    tesseract-ocr \
+# tesseract: OCR of images and scanned PDFs (PDF pages are rendered by pypdfium2).
+RUN apt-get update && apt-get install -y --no-install-recommends tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install -r requirements.txt
 
-# Application code (secrets and runtime data are excluded via .dockerignore)
-COPY . .
+# Application code only (see .dockerignore: no secrets, data, console or docs).
+COPY config/ config/
+COPY src/ src/
+COPY main.py wsgi.py gunicorn.conf.py ./
 
-RUN mkdir -p config data \
-    && useradd --create-home --uid 10001 tron \
-    && chown -R tron:tron /app
+RUN useradd --create-home --uid 10001 tron \
+    && mkdir -p /app/data \
+    && chown -R tron:tron /app/data
 USER tron
+VOLUME ["/app/data"]
 
 EXPOSE 5001
 
-ENV FLASK_APP=main.py
-ENV PYTHONUNBUFFERED=1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD ["python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5001/api/health', timeout=4).status == 200 else 1)"]
 
-CMD ["python", "main.py"]
+CMD ["gunicorn", "-c", "gunicorn.conf.py", "wsgi:app"]

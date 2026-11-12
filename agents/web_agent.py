@@ -5,11 +5,9 @@ Monitors web-related activity for data exposure.
 Scans browser history, download directories, print spools, and form-related files.
 """
 
-import os
 import sys
 import json
 import requests
-import re
 import time
 import threading
 import signal
@@ -20,7 +18,9 @@ from typing import Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.agent_updates import UpgradeRejected, agent_headers, apply_upgrade
+from src import platform_support
+from src.agent_client import AgentClient, safe_agent_id
+from src.agent_updates import UpgradeRejected, apply_upgrade
 from src.file_scanner import FileContentScanner
 from src.detection.config import DetectorConfigStore
 from src.network_monitor import BrowserHistoryScanner
@@ -33,8 +33,10 @@ class WebDLPAgent:
     def __init__(self, api_url="http://localhost:5001"):
         self.api_url = api_url
         self.agent_type = "web_agent"
-        self.user = os.getenv("USER", "unknown")
-        self.host = os.getenv("HOSTNAME", os.uname().nodename)
+        self.user = platform_support.username()
+        self.host = platform_support.hostname()
+        self.client = AgentClient(self.api_url, safe_agent_id("web-agent", self.host, self.user),
+                                  self.agent_type, self.host)
         self.session_id = hashlib.md5(f"web-{time.time()}".encode()).hexdigest()[:8]
         self.active_policies = []
 
@@ -58,6 +60,8 @@ class WebDLPAgent:
 
     def _handle_server_command(self, command: Optional[dict]):
         """Handle server-issued control commands. Only signed upgrades are accepted."""
+        if self.client.handle_command(command):
+            return
         if not isinstance(command, dict) or command.get('type') != 'upgrade':
             return
         try:
@@ -120,7 +124,7 @@ class WebDLPAgent:
                             "details": f"Blocked extension: {ext}"
                         })
             except Exception as e:
-                print(f"  ⚠️ Policy evaluation error ({policy['name']}): {e}")
+                print(f"  Policy evaluation error ({policy['name']}): {e}")
                 
         return findings
 
@@ -136,34 +140,29 @@ class WebDLPAgent:
                 "geo": metadata or {}
             }
 
-            response = requests.post(
-                f"{self.api_url}/api/events",
-                json=event_data,
-                timeout=5,
-                headers=agent_headers(),
-            )
+            response = self.client.post("/api/events", event_data, spool=True)
 
-            if response.status_code == 200:
+            if response is not None and response.status_code == 200:
                 self._stats["alerts_sent"] += 1
                 result = response.json()
-                print(f"  ✅ Event sent: {result.get('event_id')} | {channel}")
+                print(f"  Event sent: {result.get('event_id')} | {channel}")
                 return True
 
         except requests.exceptions.ConnectionError:
-            print(f"  ⚠️  Cannot reach API at {self.api_url}")
+            print(f"   Cannot reach API at {self.api_url}")
         except Exception as e:
-            print(f"  ⚠️  Error: {e}")
+            print(f"   Error: {e}")
 
         return False
 
     def sync_policies(self):
         """Sync active policies from API."""
         try:
-            response = requests.get(f"{self.api_url}/api/policies/sync", timeout=5, headers=agent_headers())
-            if response.status_code == 200:
+            response = self.client.get("/api/policies/sync", params={"agent_id": self.client.agent_id})
+            if response is not None and response.status_code == 200:
                 data = response.json()
                 self.active_policies = data.get('patterns', [])
-                # print(f"  🔄 Synced {len(self.active_policies)} policies")
+                # print(f"  Synced {len(self.active_policies)} policies")
         except Exception:
             pass
 
@@ -171,10 +170,10 @@ class WebDLPAgent:
         """Register agent with fleet management."""
         try:
             payload = {
-                "agent_id": f"web-agent-{self.host}-{self.user}",
+                "agent_id": self.client.agent_id,
                 "agent_type": self.agent_type,
                 "hostname": self.host,
-                "os": sys.platform,
+                "os": platform_support.os_label(),
                 "user": self.user,
                 "version": self.agent_version,
                 "scans_reported": self._stats["scans"],
@@ -185,8 +184,8 @@ class WebDLPAgent:
                     "python_version": sys.version.split()[0]
                 }
             }
-            res = requests.post(f"{self.api_url}/api/fleet/checkin", json=payload, timeout=5, headers=agent_headers())
-            if res.ok:
+            res = self.client.post("/api/fleet/checkin", payload)
+            if res is not None and res.ok:
                 body = res.json() if res.content else {}
                 self._handle_server_command(body.get('command'))
         except Exception:
@@ -238,7 +237,7 @@ class WebDLPAgent:
                 policy_findings = self.evaluate_policies(file_path=str(file_path))
                 for pf in policy_findings:
                     detected = True
-                    print(f"\n  🚨 POLICY VIOLATION: {pf['name']} ({pf['action'].upper()})")
+                    print(f"\n  POLICY VIOLATION: {pf['name']} ({pf['action'].upper()})")
                     print(f"     File: {file_path.name}")
                     print(f"     Details: {pf['details']}")
                     
@@ -260,7 +259,7 @@ class WebDLPAgent:
                     )
                     
                     if pf['action'] == 'block':
-                        print(f"     🛑 BLOCK ACTION: Policy requires blocking.")
+                        print("     BLOCK ACTION: Policy requires blocking.")
 
                 # 2. Deep content scan
                 result = self.file_scanner.scan_file(str(file_path))
@@ -269,7 +268,7 @@ class WebDLPAgent:
                     self._stats["threats_found"] += 1
 
                     pattern_names = list(set(f.pattern_name for f in result.findings))
-                    print(f"\n  🚨 DOWNLOAD: Sensitive file detected!")
+                    print("\n  DOWNLOAD: Sensitive file detected!")
                     print(f"     File: {file_path.name}")
                     print(f"     Patterns: {', '.join(pattern_names)}")
                     print(f"     Severity: {result.severity.upper()}")
@@ -305,7 +304,7 @@ class WebDLPAgent:
                 self._scanned_files = set(list(self._scanned_files)[-200:])
 
         except Exception as e:
-            print(f"  ⚠️  Download scan error: {e}")
+            print(f"   Download scan error: {e}")
 
         return detected
 
@@ -332,7 +331,7 @@ class WebDLPAgent:
                 detected = True
                 self._stats["threats_found"] += 1
 
-                print(f"\n  🌐 RISKY SITE: {entry['url'][:80]}")
+                print(f"\n  RISKY SITE: {entry['url'][:80]}")
 
                 self.db.add_scan_result(
                     scan_type="browser_history",
@@ -357,7 +356,7 @@ class WebDLPAgent:
                 self._flagged_history = set(list(self._flagged_history)[-500:])
 
         except Exception as e:
-            print(f"  ⚠️  Browser scan error: {e}")
+            print(f"   Browser scan error: {e}")
 
         return detected
 
@@ -375,7 +374,7 @@ class WebDLPAgent:
                             result = self.file_scanner.scan_file(str(f))
                             if result and result.findings:
                                 detected = True
-                                print(f"\n  🖨️  PRINT: Sensitive data in print job!")
+                                print("\n   PRINT: Sensitive data in print job!")
 
                                 self.send_event(
                                     user=self.user,
@@ -391,7 +390,7 @@ class WebDLPAgent:
         except PermissionError:
             pass  # Print spool often requires elevated permissions
         except Exception as e:
-            print(f"  ⚠️  Print spool scan error: {e}")
+            print(f"   Print spool scan error: {e}")
 
         return detected
 
@@ -427,12 +426,12 @@ class WebDLPAgent:
                         # Only alert on high+ severity for temp files
                         if result.severity in ('critical', 'high'):
                             detected = True
-                            print(f"\n  📁 TEMP: Sensitive data in temp file: {f.name}")
+                            print(f"\n  TEMP: Sensitive data in temp file: {f.name}")
 
         except PermissionError:
             pass
         except Exception as e:
-            print(f"  ⚠️  Temp scan error: {e}")
+            print(f"   Temp scan error: {e}")
 
         return detected
 
@@ -442,7 +441,7 @@ class WebDLPAgent:
 
         if findings:
             pattern_names = list(set(f.pattern_name for f in findings))
-            print(f"\n  🚨 FORM: Sensitive data submitted to {website}")
+            print(f"\n  FORM: Sensitive data submitted to {website}")
             print(f"     Patterns: {', '.join(pattern_names)}")
 
             return self.send_event(
@@ -465,7 +464,7 @@ class WebDLPAgent:
 
         if result and result.findings:
             pattern_names = list(set(f.pattern_name for f in result.findings))
-            print(f"\n  🖨️  PRINT: Sensitive document: {document_name}")
+            print(f"\n   PRINT: Sensitive document: {document_name}")
 
             return self.send_event(
                 user=user,
@@ -506,18 +505,18 @@ class WebDLPAgent:
 
         print(f"""
 ╔══════════════════════════════════════════════════════╗
-║  🌐 TRON WEB DLP AGENT                          ║
+║  TRON WEB DLP AGENT                          ║
 ║  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━   ║
-║  📱 Host:    {self.host:<39} ║
-║  👤 User:    {self.user:<39} ║
-║  🔗 API:     {self.api_url:<39} ║
-║  🆔 Session: {self.session_id:<39} ║
+║  Host:    {self.host:<39} ║
+║  User:    {self.user:<39} ║
+║  API:     {self.api_url:<39} ║
+║  Session: {self.session_id:<39} ║
 ║  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━   ║
 ║  MONITORS:                                           ║
-║    ✅ Download directory scanning                    ║
-║    ✅ Browser history monitoring                     ║
-║    ✅ Print spool scanning                           ║
-║    ✅ Temp file scanning                             ║
+║    Download directory scanning                    ║
+║    Browser history monitoring                     ║
+║    Print spool scanning                           ║
+║    Temp file scanning                             ║
 ║  Status: MONITORING                                  ║
 ╚══════════════════════════════════════════════════════╝
         """)
@@ -543,7 +542,7 @@ class WebDLPAgent:
 
                 timestamp = datetime.now().strftime('%H:%M:%S')
 
-                print(f"\n⏱️  Web scan #{scan_count} at {timestamp}", end="")
+                print(f"\n Web scan #{scan_count} at {timestamp}", end="")
                 self._stats["scans"] += 1
 
                 # Download monitoring (every scan)
@@ -570,8 +569,8 @@ class WebDLPAgent:
         except KeyboardInterrupt:
             pass
 
-        print(f"\n\n🛑 Web agent stopped")
-        print(f"📊 Stats: {json.dumps(self._stats, indent=2)}")
+        print("\n\nWeb agent stopped")
+        print(f"Stats: {json.dumps(self._stats, indent=2)}")
 
 
 if __name__ == "__main__":

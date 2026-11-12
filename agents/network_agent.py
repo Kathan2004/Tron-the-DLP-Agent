@@ -5,11 +5,9 @@ Monitors actual network traffic for data exfiltration.
 No simulation — all real monitoring using native OS tools.
 """
 
-import os
 import sys
 import json
 import requests
-import re
 import time
 import signal
 import hashlib
@@ -19,7 +17,9 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.agent_updates import UpgradeRejected, agent_headers, apply_upgrade
+from src import platform_support
+from src.agent_client import AgentClient, safe_agent_id
+from src.agent_updates import UpgradeRejected, apply_upgrade
 from src.network_monitor import NetworkMonitor, ProcessMonitor, BrowserHistoryScanner
 from src.file_scanner import FileContentScanner
 from src.detection.config import DetectorConfigStore
@@ -32,8 +32,10 @@ class NetworkDLPAgent:
     def __init__(self, api_url="http://localhost:5001"):
         self.api_url = api_url
         self.agent_type = "network_agent"
-        self.user = os.getenv("USER", "unknown")
-        self.host = os.getenv("HOSTNAME", os.uname().nodename)
+        self.user = platform_support.username()
+        self.host = platform_support.hostname()
+        self.client = AgentClient(self.api_url, safe_agent_id("network-agent", self.host, self.user),
+                                  self.agent_type, self.host)
         self.session_id = hashlib.md5(f"net-{time.time()}".encode()).hexdigest()[:8]
 
         # Real monitors
@@ -55,6 +57,8 @@ class NetworkDLPAgent:
 
     def _handle_server_command(self, command: Optional[dict]):
         """Handle server-issued control commands. Only signed upgrades are accepted."""
+        if self.client.handle_command(command):
+            return
         if not isinstance(command, dict) or command.get('type') != 'upgrade':
             return
         try:
@@ -76,23 +80,18 @@ class NetworkDLPAgent:
                 "geo": metadata or {}
             }
 
-            response = requests.post(
-                f"{self.api_url}/api/events",
-                json=event_data,
-                timeout=5,
-                headers=agent_headers(),
-            )
+            response = self.client.post("/api/events", event_data, spool=True)
 
-            if response.status_code == 200:
+            if response is not None and response.status_code == 200:
                 self._stats["alerts_sent"] += 1
                 result = response.json()
-                print(f"  ✅ Event sent: {result.get('event_id')} | {channel}")
+                print(f"  Event sent: {result.get('event_id')} | {channel}")
                 return True
 
         except requests.exceptions.ConnectionError:
-            print(f"  ⚠️  Cannot reach API at {self.api_url}")
+            print(f"   Cannot reach API at {self.api_url}")
         except Exception as e:
-            print(f"  ⚠️  Error: {e}")
+            print(f"   Error: {e}")
 
         return False
 
@@ -100,10 +99,10 @@ class NetworkDLPAgent:
         """Register agent with fleet management."""
         try:
             payload = {
-                "agent_id": f"network-agent-{self.host}-{self.user}",
+                "agent_id": self.client.agent_id,
                 "agent_type": self.agent_type,
                 "hostname": self.host,
-                "os": sys.platform,
+                "os": platform_support.os_label(),
                 "user": self.user,
                 "version": self.agent_version,
                 "scans_reported": self._stats["scans"],
@@ -114,8 +113,8 @@ class NetworkDLPAgent:
                     "python_version": sys.version.split()[0]
                 }
             }
-            res = requests.post(f"{self.api_url}/api/fleet/checkin", json=payload, timeout=5, headers=agent_headers())
-            if res.ok:
+            res = self.client.post("/api/fleet/checkin", payload)
+            if res is not None and res.ok:
                 body = res.json() if res.content else {}
                 self._handle_server_command(body.get('command'))
         except Exception:
@@ -138,7 +137,7 @@ class NetworkDLPAgent:
         for event in events:
             self._stats["exfiltration_attempts"] += 1
 
-            print(f"\n  🚨 [{event.risk_level.upper()}] {event.event_type}")
+            print(f"\n  [{event.risk_level.upper()}] {event.event_type}")
             print(f"     Process: {event.process} (PID: {event.pid})")
             print(f"     Target: {event.domain or event.remote_addr}:{event.remote_port}")
             print(f"     {event.details}")
@@ -173,7 +172,7 @@ class NetworkDLPAgent:
             bytes_out = volume.get("bytes_out", 0)
             # Alert if outbound exceeds threshold (100MB in one check)
             if bytes_out > 100_000_000:
-                print(f"\n  📊 HIGH OUTBOUND: {bytes_out / 1_000_000:.1f} MB")
+                print(f"\n  HIGH OUTBOUND: {bytes_out / 1_000_000:.1f} MB")
                 self.send_event(
                     user=self.user,
                     host=self.host,
@@ -194,7 +193,7 @@ class NetworkDLPAgent:
             if process not in safe_processes:
                 addr = listener.get("address", "")
                 if "0.0.0.0" in addr or "*:" in addr:
-                    print(f"\n  ⚠️  LISTENING: {listener['process']} on {addr}")
+                    print(f"\n   LISTENING: {listener['process']} on {addr}")
 
                     self.db.add_scan_result(
                         scan_type="network",
@@ -213,7 +212,7 @@ class NetworkDLPAgent:
         risky = [e for e in (chrome + safari) if e.get('risk') == 'high']
 
         for entry in risky[:3]:
-            print(f"\n  🌐 RISKY SITE: {entry['url'][:60]}")
+            print(f"\n  RISKY SITE: {entry['url'][:60]}")
             self.send_event(
                 user=self.user,
                 host=self.host,
@@ -228,7 +227,7 @@ class NetworkDLPAgent:
 
         if findings:
             pattern_names = list(set(f.pattern_name for f in findings))
-            print(f"\n  🚨 EMAIL: Sensitive data from {sender}")
+            print(f"\n  EMAIL: Sensitive data from {sender}")
             print(f"     Patterns: {', '.join(pattern_names)}")
 
             self.db.add_scan_result(
@@ -258,7 +257,7 @@ class NetworkDLPAgent:
 
         if result and result.findings:
             pattern_names = list(set(f.pattern_name for f in result.findings))
-            print(f"\n  🚨 CLOUD UPLOAD: {user} -> {destination}")
+            print(f"\n  CLOUD UPLOAD: {user} -> {destination}")
             print(f"     File: {filename}")
             print(f"     Patterns: {', '.join(pattern_names)}")
 
@@ -283,7 +282,7 @@ class NetworkDLPAgent:
 
         if findings:
             pattern_names = list(set(f.pattern_name for f in findings))
-            print(f"\n  🚨 HTTP EXFILTRATION: {user} -> {destination}")
+            print(f"\n  HTTP EXFILTRATION: {user} -> {destination}")
 
             return self.send_event(
                 user=user,
@@ -303,21 +302,21 @@ class NetworkDLPAgent:
 
         print(f"""
 ╔══════════════════════════════════════════════════════╗
-║  🌐 TRON NETWORK DLP AGENT                      ║
+║  TRON NETWORK DLP AGENT                      ║
 ║  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━   ║
-║  📱 Host:    {self.host:<39} ║
-║  👤 User:    {self.user:<39} ║
-║  🔗 API:     {self.api_url:<39} ║
-║  🆔 Session: {self.session_id:<39} ║
+║  Host:    {self.host:<39} ║
+║  User:    {self.user:<39} ║
+║  API:     {self.api_url:<39} ║
+║  Session: {self.session_id:<39} ║
 ║  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━   ║
 ║  MONITORS:                                           ║
-║    ✅ Active connection monitoring (lsof)            ║
-║    ✅ Cloud storage detection                        ║
-║    ✅ Suspicious port detection                      ║
-║    ✅ SSH tunnel detection                           ║
-║    ✅ Data volume monitoring                         ║
-║    ✅ Listening port detection                       ║
-║    ✅ Browser history scanning                       ║
+║    Active connection monitoring (lsof)            ║
+║    Cloud storage detection                        ║
+║    Suspicious port detection                      ║
+║    SSH tunnel detection                           ║
+║    Data volume monitoring                         ║
+║    Listening port detection                       ║
+║    Browser history scanning                       ║
 ║  Status: MONITORING                                  ║
 ╚══════════════════════════════════════════════════════╝
         """)
@@ -339,10 +338,10 @@ class NetworkDLPAgent:
                 scan_count += 1
                 timestamp = datetime.now().strftime('%H:%M:%S')
 
-                print(f"\n⏱️  Network scan #{scan_count} at {timestamp}", end="")
+                print(f"\n Network scan #{scan_count} at {timestamp}", end="")
 
                 # Connection monitoring (every scan)
-                alert_count = self.monitor_connections()
+                self.monitor_connections()
 
                 # Data volume check (every scan)
                 self.monitor_data_volume()
@@ -367,8 +366,8 @@ class NetworkDLPAgent:
         except KeyboardInterrupt:
             pass
 
-        print(f"\n\n🛑 Network agent stopped")
-        print(f"📊 Stats: {json.dumps(self._stats, indent=2)}")
+        print("\n\nNetwork agent stopped")
+        print(f"Stats: {json.dumps(self._stats, indent=2)}")
 
 
 if __name__ == "__main__":

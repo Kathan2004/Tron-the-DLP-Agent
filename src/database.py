@@ -9,9 +9,12 @@ import os
 import uuid
 import threading
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 from contextlib import contextmanager
 from pathlib import Path
+
+from src.crypto import get_cipher
+from src.database_platform import PlatformStoreMixin
 
 DB_DIR = Path(__file__).parent.parent / "data"
 DB_PATH = DB_DIR / "tron_dlp.db"
@@ -47,6 +50,11 @@ DEFAULT_POLICY_RULE_DATA = {
 }
 
 
+# High-volume or duplicate audit actions that are not forwarded to SIEM destinations
+# (detections and incidents are forwarded as their own record kinds).
+_AUDIT_NOT_FORWARDED = {"event_created", "incident_created", "incident_updated", "api", "portal_api_call"}
+
+
 def _json_equal(raw, expected: dict) -> bool:
     try:
         return json.loads(raw or "{}") == expected
@@ -54,7 +62,7 @@ def _json_equal(raw, expected: dict) -> bool:
         return False
 
 
-class Database:
+class Database(PlatformStoreMixin):
     """Thread-safe SQLite database for DLP data persistence."""
 
     def __init__(self, db_path: Optional[str] = None):
@@ -62,8 +70,19 @@ class Database:
             _migrate_legacy_db_name()
         self.db_path = str(db_path or DB_PATH)
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        # Seals matched text, payload samples and artifacts (see src/crypto.py).
+        self.cipher = get_cipher(os.path.dirname(self.db_path))
         self._local = threading.local()
+        # Callables receiving a dict for every incident/event/audit record (SIEM forwarding).
+        self.record_sinks: list = []
         self._init_schema()
+
+    def _publish(self, record: Dict) -> None:
+        for sink in self.record_sinks:
+            try:
+                sink(record)
+            except Exception:
+                pass  # a failing sink must never break the write that triggered it
 
     def _get_conn(self) -> sqlite3.Connection:
         """Get thread-local connection."""
@@ -71,6 +90,8 @@ class Database:
             self._local.conn = sqlite3.connect(self.db_path, timeout=30)
             self._local.conn.row_factory = sqlite3.Row
             self._local.conn.execute("PRAGMA journal_mode=WAL")
+            self._local.conn.execute("PRAGMA synchronous=NORMAL")
+            self._local.conn.execute("PRAGMA busy_timeout=30000")
             self._local.conn.execute("PRAGMA foreign_keys=ON")
         return self._local.conn
 
@@ -516,6 +537,8 @@ class Database:
                 );
             """)
 
+            self._init_platform_schema(cur)
+
             # Seed security team if empty
             cur.execute("SELECT COUNT(*) FROM security_team")
             if cur.fetchone()[0] == 0:
@@ -638,12 +661,15 @@ class Database:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 event_id, timestamp, agent_type, source_host, user, channel,
-                payload_hash, payload_sample,
+                payload_hash, self.cipher.seal_text(payload_sample),
                 json.dumps(matched_rules),
                 severity,
                 json.dumps(geo or {})
             ))
         self._log_audit("event_created", "event", event_id, user)
+        self._publish({"kind": "event", "action": "detection", "id": event_id, "user": user,
+                       "host": source_host, "channel": channel, "severity": severity,
+                       "detectors": list(matched_rules or []), "agent_type": agent_type})
         return event_id
 
     def get_event(self, event_id: str) -> Optional[Dict]:
@@ -707,7 +733,9 @@ class Database:
                         return self._row_to_incident_dict(row)
             raise
         self._log_audit("incident_created", "incident", incident_id, user)
-        return self.get_incident(incident_id)
+        incident = self.get_incident(incident_id)
+        self._publish_incident(incident, "created")
+        return incident
 
     def get_incident(self, incident_id: str) -> Optional[Dict]:
         """Get incident by ID."""
@@ -775,7 +803,23 @@ class Database:
                 values
             )
         self._log_audit("incident_updated", "incident", incident_id, details=json.dumps(list(kwargs.keys())))
-        return self.get_incident(incident_id)
+        incident = self.get_incident(incident_id)
+        if 'status' in updates:
+            self._publish_incident(incident, str(updates['status']).lower())
+        return incident
+
+    def _publish_incident(self, incident: Optional[Dict], action: str) -> None:
+        if not incident:
+            return
+        risk = int(incident.get('risk') or 0)
+        self._publish({
+            "kind": "incident", "action": action, "id": incident.get('incident_id'),
+            "user": incident.get('user'), "host": incident.get('host'), "channel": incident.get('channel'),
+            "status": incident.get('status'), "risk": risk, "verdict": incident.get('verdict'),
+            "severity": "critical" if risk >= 85 else "high" if risk >= 60 else "medium" if risk >= 35 else "low",
+            "detectors": [p.strip() for p in str(incident.get('pattern') or '').split(',') if p.strip()],
+            "assigned_to": incident.get('assigned_to'),
+        })
 
     def close_incident(self, incident_id: str, reason: str = "user_closed") -> Optional[Dict]:
         """Close an incident."""
@@ -1332,7 +1376,7 @@ class Database:
                 (agent_id, scan_type, source, findings, severity, file_path, file_hash, file_size, user, host)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                agent_id, scan_type, source, json.dumps(findings), severity,
+                agent_id, scan_type, source, self.cipher.seal_text(json.dumps(findings)), severity,
                 file_path, file_hash, file_size, user, host
             ))
             return cur.lastrowid
@@ -1349,7 +1393,7 @@ class Database:
                 cur.execute("""
                     SELECT * FROM scan_results ORDER BY timestamp DESC LIMIT ?
                 """, (limit,))
-            return [dict(row) for row in cur.fetchall()]
+            return [self._scan_row(row) for row in cur.fetchall()]
 
     # ==================== STATISTICS ====================
 
@@ -1404,15 +1448,15 @@ class Database:
     def _log_audit(self, action: str, target_type: Optional[str] = None,
                    target_id: Optional[str] = None, actor: Optional[str] = None,
                    details: Optional[str] = None):
-        """Log an audit event."""
+        """Log an audit event (hash-chained, see verify_audit_chain)."""
         try:
-            with self._cursor() as cur:
-                cur.execute("""
-                    INSERT INTO audit_log (action, target_type, target_id, actor, details)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (action, target_type, target_id, actor, details))
+            self._append_audit_chained(action, target_type, target_id, actor, details)
         except Exception:
             pass  # Don't let audit logging break main operations
+        if action not in _AUDIT_NOT_FORWARDED:
+            self._publish({"kind": "agent" if target_type == "agent" else "audit", "action": action,
+                           "id": target_id, "actor": actor, "severity": "info",
+                           "message": f"{action} {target_type or ''} {target_id or ''}".strip()})
 
     def add_audit_entry(self,
                         action: str,
@@ -1679,7 +1723,7 @@ class Database:
                     WHERE host = ? 
                     ORDER BY timestamp DESC LIMIT ?
                 """, (hostname, limit))
-            return [dict(row) for row in cur.fetchall()]
+            return [self._scan_row(row) for row in cur.fetchall()]
 
     def get_agent_events(self, hostname: str, limit: int = 50) -> List[Dict]:
         """Get recent events where source_host or host matches the given hostname."""
@@ -1760,7 +1804,7 @@ class Database:
             # Parse findings JSON for readability
             for r in rows:
                 try:
-                    r['findings'] = json.loads(r.get('findings') or '[]')
+                    r['findings'] = json.loads(self.cipher.open_text(r.get('findings')) or '[]')
                 except Exception:
                     pass
             return rows
@@ -1814,7 +1858,7 @@ class Database:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 artifact_id, agent_id, scan_id, hostname, user, source_host, file_name, file_type, file_size,
-                action, severity, json.dumps(findings or []), content_path, content_sha256
+                action, severity, self.cipher.seal_text(json.dumps(findings or [])), content_path, content_sha256
             ))
         return artifact_id
 
@@ -1843,7 +1887,7 @@ class Database:
             rows = [dict(r) for r in cur.fetchall()]
             for r in rows:
                 try:
-                    r['findings'] = json.loads(r.get('findings') or '[]')
+                    r['findings'] = json.loads(self.cipher.open_text(r.get('findings')) or '[]')
                 except Exception:
                     r['findings'] = []
             return rows
@@ -1857,16 +1901,23 @@ class Database:
                 return None
             d = dict(row)
             try:
-                d['findings'] = json.loads(d.get('findings') or '[]')
+                d['findings'] = json.loads(self.cipher.open_text(d.get('findings')) or '[]')
             except Exception:
                 d['findings'] = []
             return d
 
     # ==================== HELPERS ====================
 
+    def _scan_row(self, row) -> Dict:
+        """scan_results row with `findings` decrypted (still a JSON string, as callers expect)."""
+        d = dict(row)
+        d['findings'] = self.cipher.open_text(d.get('findings'))
+        return d
+
     def _row_to_event_dict(self, row) -> Optional[Dict]:
         """Convert a DB row to event dict."""
         d = dict(row)
+        d['payload_sample'] = self.cipher.open_text(d.get('payload_sample'))
         d['matched_rules'] = json.loads(d.get('matched_rules') or '[]')
         d['geo'] = json.loads(d.get('geo') or '{}')
         return d
